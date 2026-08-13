@@ -19,7 +19,15 @@ from dotenv import load_dotenv
 from jinja2 import Template
 
 sys.path.insert(0, str(Path(__file__).parent))
-from src.name_mapper import NameMapper, canonical_first_name, build_chat_labeler
+from src.name_mapper import (
+    NameMapper,
+    canonical_first_name,
+    build_chat_labeler,
+    label_with_last_initial,
+    label_with_last_name,
+    normalize_phone,
+    person_identity_key,
+)
 
 # 2000–2007 are tapbacks; 3000s are removals
 TAPBACK_RANGE = range(2000, 2008)
@@ -91,13 +99,17 @@ def _parse_ymd(raw, label):
     try:
         return datetime.strptime(raw.strip(), "%Y-%m-%d")
     except ValueError:
-        print(f"Error: {label} must be YYYY-MM-DD (got {raw!r})", file=sys.stderr)
-        sys.exit(1)
+        raise ValueError(f"{label} must be YYYY-MM-DD (got {raw!r})")
 
 
 class Config:
-    def __init__(self, args):
+    def __init__(self, args=None):
         load_dotenv()
+        if args is None:
+            args = argparse.Namespace(
+                db=None, outdir=None, gcs=None, keywords=None,
+                year=None, since=None, until=None, export=None,
+            )
         self.db_path = self._expand(args.db or os.getenv("DB_PATH", "~/Library/Messages/chat.db"))
         self.output_dir = self._expand(args.outdir or os.getenv("OUTPUT_DIR", "./output"))
         self.aliases_file = self._expand(os.getenv("ALIASES_FILE", "./aliases.json"))
@@ -111,15 +123,43 @@ class Config:
             print(f"Error: unknown TIMEZONE {tz_name!r}. Use an IANA name like America/New_York.", file=sys.stderr)
             sys.exit(1)
         self.tz_label = os.getenv("TIMEZONE_LABEL") or _friendly_tz_label(tz_name, self.tz)
-        raw = args.gcs or os.getenv("TARGET_CHATS") or os.getenv("TARGET_GROUP_CHATS", "")
+        raw = getattr(args, "gcs", None) or os.getenv("TARGET_CHATS") or os.getenv("TARGET_GROUP_CHATS", "")
         self.target_gcs = [g.strip() for g in raw.split(",") if g.strip()]
-        kw_raw = getattr(args, "keywords", None) or os.getenv("KEYWORDS", "")
-        self.keywords = [w.strip() for w in kw_raw.split(",") if w.strip()]
-        self.since, self.until, self.filter_label = self._parse_date_filter(args)
+        kw_raw = getattr(args, "keywords", None)
+        if kw_raw is None:
+            kw_raw = os.getenv("KEYWORDS", "")
+        self.keywords = [w.strip() for w in str(kw_raw).split(",") if w.strip()]
+        # App mode: absolute /report URLs + link back to picker
+        self.app_mode = bool(getattr(args, "app_mode", False))
+        self.public_prefix = (getattr(args, "public_prefix", None) or "/report").rstrip("/") or "/report"
+        # In the web app, date filters come only from the form (not leftover .env YEAR)
+        self.since, self.until, self.filter_label = self._parse_date_filter(
+            args, allow_env=not self.app_mode
+        )
         export_raw = getattr(args, "export", None)
         if export_raw is None:
             export_raw = os.getenv("EXPORT", "csv,json")
         self.export_formats = self._parse_export(export_raw)
+
+    @classmethod
+    def for_app(cls, *, year=None, since=None, until=None, keywords=None, export=None):
+        """Config for the local web app (picker-driven, no TARGET_GROUP_CHATS required)."""
+        args = argparse.Namespace(
+            db=None, outdir=None, gcs="", keywords=keywords,
+            year=year, since=since, until=until, export=export,
+            app_mode=True, public_prefix="/report",
+        )
+        return cls(args)
+
+    def apply_runtime_filters(self, *, year=None, since=None, until=None, keywords=None, export=None):
+        """Override date/keyword/export for one analyze request. Raises ValueError on bad input."""
+        if keywords is not None:
+            self.keywords = [w.strip() for w in str(keywords).split(",") if w.strip()]
+        if export is not None:
+            self.export_formats = self._parse_export(export)
+        args = argparse.Namespace(year=year, since=since, until=until)
+        # Clear env-based filter if request passes explicit empties via sentinel
+        self.since, self.until, self.filter_label = self._parse_date_filter(args, allow_env=False)
 
     def _expand(self, p):
         return Path(p).expanduser().resolve()
@@ -133,23 +173,32 @@ class Config:
         parts = {p.strip() for p in text.split(",") if p.strip()}
         bad = parts - {"csv", "json"}
         if bad:
-            print(f"Error: unknown EXPORT format(s): {', '.join(sorted(bad))} (use csv, json, or none)", file=sys.stderr)
-            sys.exit(1)
+            raise ValueError(f"unknown EXPORT format(s): {', '.join(sorted(bad))} (use csv, json, or none)")
         return parts
 
-    def _parse_date_filter(self, args):
+    def _parse_date_filter(self, args, allow_env=True):
         year = getattr(args, "year", None)
-        if year is None:
+        if year is None and allow_env:
             year_env = os.getenv("YEAR", "").strip()
             year = int(year_env) if year_env else None
-        since_raw = getattr(args, "since", None) or os.getenv("SINCE", "").strip() or None
-        until_raw = getattr(args, "until", None) or os.getenv("UNTIL", "").strip() or None
+        elif year is not None and year != "":
+            year = int(year)
+        else:
+            year = None
+
+        since_raw = getattr(args, "since", None)
+        until_raw = getattr(args, "until", None)
+        if allow_env:
+            since_raw = since_raw or os.getenv("SINCE", "").strip() or None
+            until_raw = until_raw or os.getenv("UNTIL", "").strip() or None
+        else:
+            since_raw = (since_raw or "").strip() or None
+            until_raw = (until_raw or "").strip() or None
 
         since = until = None
         if year is not None:
             if since_raw or until_raw:
-                print("Error: use YEAR alone, or SINCE/UNTIL — not both.", file=sys.stderr)
-                sys.exit(1)
+                raise ValueError("use YEAR alone, or SINCE/UNTIL — not both")
             since = self.tz.localize(datetime(int(year), 1, 1, 0, 0, 0))
             until = self.tz.localize(datetime(int(year) + 1, 1, 1, 0, 0, 0))
             return since, until, str(int(year))
@@ -157,13 +206,11 @@ class Config:
         if since_raw:
             since = self.tz.localize(_parse_ymd(since_raw, "SINCE/--since"))
         if until_raw:
-            # inclusive calendar day → start of next day (exclusive)
             day = _parse_ymd(until_raw, "UNTIL/--until")
             until = self.tz.localize(day + timedelta(days=1))
 
         if since and until and since >= until:
-            print("Error: SINCE must be before UNTIL.", file=sys.stderr)
-            sys.exit(1)
+            raise ValueError("SINCE must be before UNTIL")
 
         if not since and not until:
             return None, None, None
@@ -222,14 +269,21 @@ def get_connection(db_path):
 
 
 def load_chat_catalog(conn):
-    """All chats with message counts, classified as group or dm."""
+    """All chats with message counts and last activity (iMessage-style recency)."""
     return pd.read_sql_query(
         """
         SELECT c.ROWID AS chat_id,
                c.display_name AS display_name,
                c.chat_identifier AS chat_identifier,
                c.style AS style,
+               COALESCE(c.is_filtered, 0) AS is_filtered,
+               COALESCE(c.is_archived, 0) AS is_archived,
                COUNT(cmj.message_id) AS messages,
+               MAX(m.date) AS last_date,
+               (
+                 SELECT COUNT(*) FROM chat_handle_join chj
+                 WHERE chj.chat_id = c.ROWID
+               ) AS handle_count,
                (
                  SELECT h.id FROM chat_handle_join chj
                  JOIN handle h ON h.ROWID = chj.handle_id
@@ -238,26 +292,71 @@ def load_chat_catalog(conn):
                ) AS peer_id
         FROM chat c
         JOIN chat_message_join cmj ON c.ROWID = cmj.chat_id
+        JOIN message m ON m.ROWID = cmj.message_id
+        WHERE COALESCE(c.is_filtered, 0) = 0
         GROUP BY c.ROWID
         HAVING messages > 0
-        ORDER BY messages DESC
+        ORDER BY last_date DESC
         """,
         conn,
     )
 
 
+def _looks_like_shortcode(identifier):
+    """US-style short codes / blast SMS (usually spam or OTP), not a real person."""
+    s = str(identifier or "").strip()
+    if not s or "@" in s:
+        return False
+    digits = "".join(c for c in s if c.isdigit())
+    return digits == s.replace("+", "").replace("-", "").replace(" ", "") and 4 <= len(digits) <= 6
+
+
 def is_dm_row(row):
+    """
+    True only for real iMessage/SMS 1:1 threads.
+
+    - style 45 = Instant Message (1:1)
+    - exactly one handle on the chat
+    - not a group room id (chat…)
+    - not short-code / blast SMS
+    - not Filtered Unknown Senders (is_filtered already excluded in catalog)
+    """
+    style = row.get("style")
+    ident = str(row.get("chat_identifier") or "")
+    peer = row.get("peer_id") or ident
+    handles = int(row.get("handle_count") or 0)
+    if style != 45:
+        return False
+    if handles != 1:
+        return False
+    if ident.startswith("chat"):
+        return False
+    if _looks_like_shortcode(peer) or _looks_like_shortcode(ident):
+        return False
+    return True
+
+
+def is_group_row(row):
+    """Named group chats only — skip unnamed rooms that would look like junk."""
     style = row.get("style")
     name = (row.get("display_name") or "").strip()
+    if not name:
+        return False
+    # Prefer style 43 (group), but allow named non-DM chats
     if style == 45:
-        return True
-    if not name and row.get("peer_id") and not str(row.get("chat_identifier") or "").startswith("chat"):
-        return True
-    return False
+        return False
+    ident = str(row.get("chat_identifier") or "")
+    handles = int(row.get("handle_count") or 0)
+    # Unnamed multi-person rooms are already excluded by empty name.
+    # Drop 0-handle leftovers.
+    if handles < 2 and not ident.startswith("chat"):
+        # Odd named 1-handle non-DM — skip
+        return False
+    return True
 
 
 def dm_labels(mapper, identifier):
-    """Return (list_label, match_keys) for a 1:1 peer."""
+    """Return (list_label, match_keys, resolved_full_name)."""
     ident = str(identifier or "").strip()
     resolved = mapper.resolve(ident) if ident else None
     first = canonical_first_name(resolved) if resolved else None
@@ -267,81 +366,230 @@ def dm_labels(mapper, identifier):
     if resolved:
         keys.add(resolved.lower())
         keys.add(canonical_first_name(resolved).lower())
+        keys.add(person_identity_key(resolved))
     if first:
         keys.add(first.lower())
     label = first or resolved or ident or "Unknown"
     return label, keys, resolved
 
 
-def build_chat_index(conn, mapper):
-    """Catalog with stable display titles for groups and 1:1s."""
+def contact_merge_key(mapper, identifier):
+    """Same Contacts person → same key (merges phone + email threads)."""
+    ident = str(identifier or "").strip()
+    if not ident or ident.lower() == "nan":
+        return None
+    resolved = mapper.resolve(ident)
+    if resolved:
+        return "contact:" + person_identity_key(resolved)
+    if "@" in ident:
+        return "email:" + ident.lower()
+    digits = normalize_phone(ident)
+    if digits:
+        return "phone:" + digits
+    return "id:" + ident.lower()
+
+
+def build_chat_index(conn, mapper, tz=None):
+    """
+    Catalog with Group vs 1:1 lists.
+
+    1:1 threads that resolve to the same Contacts person (phone + email) are merged.
+    Groups with the same display name are merged (iMessage often creates a new
+    room id for the same named group).
+    Both lists are sorted by last message time (newest first), like Messages.app.
+    """
     catalog = load_chat_catalog(conn)
-    groups = []
-    dms = []
-    used_dm_labels = defaultdict(int)
+    group_buckets = {}
+    dm_buckets = {}
 
     for _, row in catalog.iterrows():
+        last_raw = row["last_date"]
         if is_dm_row(row):
-            label, keys, resolved = dm_labels(mapper, row["peer_id"] or row["chat_identifier"])
-            used_dm_labels[label.lower()] += 1
-            dms.append({
-                "chat_id": int(row["chat_id"]),
-                "kind": "dm",
-                "label": label,
-                "resolved": resolved,
-                "identifier": row["peer_id"] or row["chat_identifier"],
-                "messages": int(row["messages"]),
-                "keys": keys,
-            })
-        else:
-            name = (row["display_name"] or "").strip()
-            if not name:
+            ident = row["peer_id"] or row["chat_identifier"]
+            if ident is not None and (isinstance(ident, float) and pd.isna(ident)):
+                ident = row["chat_identifier"]
+            label, keys, resolved = dm_labels(mapper, ident)
+            mkey = contact_merge_key(mapper, ident)
+            if mkey is None:
                 continue
-            groups.append({
-                "chat_id": int(row["chat_id"]),
-                "kind": "group",
-                "label": name,
-                "messages": int(row["messages"]),
-                "keys": {name.lower()},
-            })
+            chat_id = int(row["chat_id"])
+            msgs = int(row["messages"])
+            ident_s = str(ident).strip() if ident is not None and str(ident) != "nan" else ""
+            if mkey in dm_buckets:
+                entry = dm_buckets[mkey]
+                entry["chat_ids"].append(chat_id)
+                entry["messages"] += msgs
+                entry["keys"] |= keys
+                if ident_s and ident_s not in entry["identifiers"]:
+                    entry["identifiers"].append(ident_s)
+                if last_raw is not None and not (isinstance(last_raw, float) and pd.isna(last_raw)):
+                    if entry.get("last_date_raw") is None or last_raw > entry["last_date_raw"]:
+                        entry["last_date_raw"] = last_raw
+                        entry["chat_id"] = chat_id  # newest thread as primary
+                if resolved and (
+                    not entry.get("resolved")
+                    or len(str(resolved)) >= len(str(entry.get("resolved") or ""))
+                ):
+                    entry["resolved"] = resolved
+                    entry["label"] = canonical_first_name(resolved)
+            else:
+                dm_buckets[mkey] = {
+                    "chat_id": chat_id,
+                    "chat_ids": [chat_id],
+                    "kind": "dm",
+                    "label": label,
+                    "resolved": resolved,
+                    "identifier": ident_s or None,
+                    "identifiers": [ident_s] if ident_s else [],
+                    "messages": msgs,
+                    "keys": set(keys),
+                    "last_date_raw": last_raw if last_raw is not None and not (isinstance(last_raw, float) and pd.isna(last_raw)) else None,
+                    "merge_key": mkey,
+                }
+        elif is_group_row(row):
+            name = (row["display_name"] or "").strip()
+            gkey = name.casefold()
+            chat_id = int(row["chat_id"])
+            msgs = int(row["messages"])
+            if gkey in group_buckets:
+                entry = group_buckets[gkey]
+                entry["chat_ids"].append(chat_id)
+                entry["messages"] += msgs
+                if last_raw is not None and not (isinstance(last_raw, float) and pd.isna(last_raw)):
+                    if entry.get("last_date_raw") is None or last_raw > entry["last_date_raw"]:
+                        entry["last_date_raw"] = last_raw
+                        entry["chat_id"] = chat_id
+                        entry["label"] = name  # prefer casing from newest thread
+            else:
+                group_buckets[gkey] = {
+                    "chat_id": chat_id,
+                    "chat_ids": [chat_id],
+                    "kind": "group",
+                    "label": name,
+                    "messages": msgs,
+                    "keys": {name.lower()},
+                    "last_date_raw": last_raw if last_raw is not None and not (isinstance(last_raw, float) and pd.isna(last_raw)) else None,
+                }
+        # else: spam, unnamed group rooms, odd leftovers — skip
 
-    # Disambiguate duplicate first names among DMs
+    groups = list(group_buckets.values())
+    dms = list(dm_buckets.values())
+
+    used_dm_labels = defaultdict(int)
     for dm in dms:
-        if used_dm_labels[dm["label"].lower()] > 1 and dm["identifier"]:
-            short = str(dm["identifier"])
+        used_dm_labels[dm["label"].lower()] += 1
+    for dm in dms:
+        if used_dm_labels[dm["label"].lower()] <= 1:
+            continue
+        if dm.get("resolved"):
+            dm["label"] = label_with_last_initial(dm["resolved"], canonical_first_name(dm["resolved"]))
+        elif dm.get("identifiers"):
+            short = str(dm["identifiers"][0])
             if len(short) > 18:
                 short = short[:14] + "…"
             dm["label"] = f"{dm['label']} ({short})"
+        dm["keys"].add(dm["label"].lower())
+
+    label_counts = defaultdict(int)
+    for dm in dms:
+        label_counts[dm["label"].lower()] += 1
+    for dm in dms:
+        if label_counts[dm["label"].lower()] > 1 and dm.get("resolved"):
+            dm["label"] = label_with_last_name(dm["resolved"], canonical_first_name(dm["resolved"]))
             dm["keys"].add(dm["label"].lower())
 
+    # Attach human-readable last activity when tz known
+    if tz is not None:
+        for c in groups + dms:
+            raw = c.get("last_date_raw")
+            if raw is None:
+                c["last_active"] = None
+                c["last_active_label"] = ""
+            else:
+                dt = convert_timestamp(raw, tz)
+                c["last_active"] = dt
+                c["last_active_label"] = format_last_active(dt, tz) if dt is not None else ""
+
+    def sort_key(c):
+        raw = c.get("last_date_raw")
+        if raw is None:
+            return 0
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return 0
+
+    groups.sort(key=sort_key, reverse=True)
+    dms.sort(key=sort_key, reverse=True)
     return groups, dms
 
 
+def format_last_active(dt, tz):
+    """Short recency label similar to Messages (Today / Yesterday / date)."""
+    if dt is None or pd.isna(dt):
+        return ""
+    now = datetime.now(tz)
+    local = dt.astimezone(tz) if getattr(dt, "tzinfo", None) else tz.localize(dt.to_pydatetime() if hasattr(dt, "to_pydatetime") else dt)
+    today = now.date()
+    d = local.date()
+    if d == today:
+        return local.strftime("%-I:%M %p")
+    if d == today - timedelta(days=1):
+        return "Yesterday"
+    if (today - d).days < 7:
+        return local.strftime("%a")
+    if local.year == now.year:
+        return local.strftime("%b %-d")
+    return local.strftime("%b %-d, %Y")
+
+
 def print_chat_list(groups, dms):
-    print("GROUP CHATS")
-    print(f"{'Messages':>10}  Name (use this in TARGET_GROUP_CHATS)")
-    print("-" * 56)
+    print("GROUP CHATS (newest first)")
+    print(f"{'Last':>12}  {'Messages':>10}  Name")
+    print("-" * 60)
     if not groups:
         print("  (none)")
     for g in groups:
-        print(f"{g['messages']:>10,}  {g['label']}")
+        last = g.get("last_active_label") or "—"
+        print(f"{last:>12}  {g['messages']:>10,}  {g['label']}")
 
-    print("\nONE-ON-ONE")
-    print(f"{'Messages':>10}  Name (use this in TARGET_GROUP_CHATS)")
-    print("-" * 56)
+    print("\nONE-ON-ONE (newest first · phone+email merged by Contacts)")
+    print(f"{'Last':>12}  {'Messages':>10}  Name")
+    print("-" * 60)
     if not dms:
         print("  (none)")
     for d in dms[:80]:
-        print(f"{d['messages']:>10,}  {d['label']}")
+        last = d.get("last_active_label") or "—"
+        extra = ""
+        if len(d.get("chat_ids") or []) > 1:
+            extra = f"  [{len(d['chat_ids'])} threads]"
+        print(f"{last:>12}  {d['messages']:>10,}  {d['label']}{extra}")
     if len(dms) > 80:
         print(f"  … and {len(dms) - 80} more")
 
     print("\nCopy names into TARGET_GROUP_CHATS in .env (comma-separated).")
     print("Groups and 1:1 chats both work. Spelling must match the Name column.")
+    print("Or run `python app.py` and pick a chat in the browser.")
 
 
-def find_chats(conn, names, mapper):
-    groups, dms = build_chat_index(conn, mapper)
+def find_chat_by_id(conn, mapper, chat_id, tz=None):
+    groups, dms = build_chat_index(conn, mapper, tz=tz)
+    chat_id = int(chat_id)
+    for c in groups + dms:
+        ids = c.get("chat_ids") or [c["chat_id"]]
+        if chat_id in ids or c["chat_id"] == chat_id:
+            return c
+    return None
+
+
+def kind_subtitle(kind, chat_name, member_count, your_name):
+    if kind == "dm":
+        return "1:1", f"1:1 · {your_name} & {chat_name}"
+    return "Group", f"Group · {member_count} people"
+
+
+def find_chats(conn, names, mapper, tz=None):
+    groups, dms = build_chat_index(conn, mapper, tz=tz)
     catalog = groups + dms
     found = {}
     for name in names:
@@ -350,7 +598,6 @@ def find_chats(conn, names, mapper):
             continue
         matches = [c for c in catalog if needle in c["keys"] or needle == c["label"].lower()]
         if not matches:
-            # substring fallback on labels
             matches = [c for c in catalog if needle in c["label"].lower()]
         if not matches:
             print(f"  Warning: no chat named {name!r}")
@@ -360,13 +607,16 @@ def find_chats(conn, names, mapper):
                 for c in close:
                     print(f"      - {c['label']}")
             continue
-        # Prefer exact key match, then most messages
         exact = [c for c in matches if needle in c["keys"] or needle == c["label"].lower()]
-        pick = max(exact or matches, key=lambda c: c["messages"])
+        pick = max(exact or matches, key=lambda c: c.get("last_date_raw") or 0)
         title = pick["label"]
-        if title in found and found[title] != pick["chat_id"]:
+        if title in found and found[title]["chat_id"] != pick["chat_id"]:
             title = f"{title} · {pick['chat_id']}"
-        found[title] = pick["chat_id"]
+        found[title] = {
+            "chat_id": pick["chat_id"],
+            "chat_ids": pick.get("chat_ids") or [pick["chat_id"]],
+            "kind": pick["kind"],
+        }
     return found
 
 
@@ -431,6 +681,13 @@ def extract_guid(raw):
 
 
 def load_chat(conn, chat_id, tz):
+    """Load messages + tapbacks for one chat_id or a list of chat_ids (merged 1:1)."""
+    if isinstance(chat_id, (list, tuple, set)):
+        ids = [int(x) for x in chat_id]
+    else:
+        ids = [int(chat_id)]
+    id_list = ",".join(str(i) for i in ids)
+
     messages = pd.read_sql_query(
         f"""
         SELECT h.id AS handle_id, m.is_from_me, m.date, m.guid AS message_guid,
@@ -438,12 +695,15 @@ def load_chat(conn, chat_id, tz):
         FROM message m
         LEFT JOIN handle h ON m.handle_id = h.ROWID
         JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
-        WHERE cmj.chat_id = {chat_id}
+        WHERE cmj.chat_id IN ({id_list})
         """,
         conn,
     )
     messages["datetime"] = messages["date"].apply(lambda v: convert_timestamp(v, tz))
     messages = messages[messages["datetime"].dt.year >= 2005].copy()
+    # Dedupe same message linked into multiple chats
+    if "message_guid" in messages.columns and not messages.empty:
+        messages = messages.drop_duplicates(subset=["message_guid"], keep="first")
     types = messages["associated_message_type"]
     real = messages[types.isna() | ~types.isin(list(TAPBACK_RANGE) + list(REMOVE_RANGE))].copy()
     real["body"] = [
@@ -454,11 +714,12 @@ def load_chat(conn, chat_id, tz):
     reactions = pd.read_sql_query(
         f"""
         SELECT m.associated_message_guid, m.associated_message_type,
-               h.id AS reactor_handle_id, m.is_from_me AS reactor_is_me, m.date
+               h.id AS reactor_handle_id, m.is_from_me AS reactor_is_me, m.date,
+               m.guid AS reaction_guid
         FROM message m
         LEFT JOIN handle h ON m.handle_id = h.ROWID
         JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
-        WHERE cmj.chat_id = {chat_id}
+        WHERE cmj.chat_id IN ({id_list})
           AND m.associated_message_guid IS NOT NULL
           AND m.associated_message_type BETWEEN 2000 AND 2007
         """,
@@ -466,6 +727,8 @@ def load_chat(conn, chat_id, tz):
     )
     if not reactions.empty:
         reactions["datetime"] = reactions["date"].apply(lambda v: convert_timestamp(v, tz))
+        if "reaction_guid" in reactions.columns:
+            reactions = reactions.drop_duplicates(subset=["reaction_guid"], keep="first")
     return real, reactions
 
 
@@ -943,6 +1206,54 @@ def ranked(members, key, ascending=False):
     return out
 
 
+def analyze_chats(conn, mapper, chat_map, config, quiet=False):
+    """
+    Load, filter, score, and render chats.
+
+    chat_map: {display_name: chat_id} or {display_name: {"chat_id": int, "chat_ids": [...], "kind": ...}}
+    Returns (index_path, exports, all_data).
+    """
+    all_data = {}
+    for name, spec in chat_map.items():
+        if isinstance(spec, dict):
+            chat_ids = spec.get("chat_ids") or [spec["chat_id"]]
+            kind = spec.get("kind") or "group"
+        else:
+            chat_ids = [int(spec)]
+            kind = "group"
+        if not quiet:
+            print(f"\n{name}")
+            if len(chat_ids) > 1:
+                print(f"  Merged {len(chat_ids)} threads (phone/email)")
+        messages, reactions = load_chat(conn, chat_ids, config.tz)
+        before = len(messages)
+        messages, reactions = apply_date_filter(messages, reactions, config.since, config.until)
+        if not quiet:
+            if config.filter_label:
+                print(f"  {len(messages):,}/{before:,} messages in range, {len(reactions):,} tapbacks")
+            else:
+                print(f"  {len(messages):,} messages, {len(reactions):,} tapbacks")
+        if messages.empty:
+            if not quiet:
+                print("  Skipping — no messages in this date range")
+            continue
+        payload = compute_stats(messages, reactions, mapper, config.keywords)
+        badge, subtitle = kind_subtitle(
+            kind, name, payload["chat_info"]["member_count"], config.your_name
+        )
+        payload["chat_info"]["kind"] = kind
+        payload["chat_info"]["kind_badge"] = badge
+        payload["chat_info"]["kind_subtitle"] = subtitle
+        all_data[name] = payload
+        if not quiet:
+            print(f"  {payload['chat_info']['member_count']} people · {badge}")
+
+    if not all_data:
+        raise ValueError("No chats had messages in the selected range.")
+    out, exports = render(all_data, config)
+    return out, exports, all_data
+
+
 def wipe_output(output_dir):
     if output_dir.exists():
         shutil.rmtree(output_dir)
@@ -1077,18 +1388,44 @@ def render(all_data, config):
     chats = []
     for chat_name, payload in all_data.items():
         folder = slug(chat_name)
+        info = payload["chat_info"]
+        if config.app_mode:
+            messages_url = f"{config.public_prefix}/{folder}/index.html"
+            urls = {
+                f"{key}_url": (
+                    f"{config.public_prefix}/{folder}/{page_filename(file_id)}"
+                )
+                for key, _label, file_id in nav
+            }
+        else:
+            messages_url = f"{folder}/index.html"
+            urls = chat_urls(folder, nav, relative=False)
         chats.append({
             "name": chat_name,
             "folder": folder,
-            **chat_urls(folder, nav, relative=False),
-            "total_messages": payload["chat_info"]["total_messages"],
-            "member_count": payload["chat_info"]["member_count"],
-            "start_date": payload["chat_info"]["start_date"],
-            "end_date": payload["chat_info"]["end_date"],
+            "messages_url": messages_url,
+            **urls,
+            "total_messages": info["total_messages"],
+            "member_count": info["member_count"],
+            "start_date": info["start_date"],
+            "end_date": info["end_date"],
+            "kind": info.get("kind", "group"),
+            "kind_badge": info.get("kind_badge", "Group"),
+            "kind_subtitle": info.get("kind_subtitle", ""),
+            "csv_url": (
+                f"{config.public_prefix}/{folder}/stats.csv" if config.app_mode else f"{folder}/stats.csv"
+            ),
+            "json_url": (
+                f"{config.public_prefix}/{folder}/stats.json" if config.app_mode else f"{folder}/stats.json"
+            ),
         })
 
     generated = datetime.now(config.tz)
     tz_label = config.tz_label
+    home_href = "/" if config.app_mode else None
+    home_label = "Pick chat" if config.app_mode else "All chats"
+    css_page = f"{config.public_prefix}/css/style.css" if config.app_mode else "../css/style.css"
+    css_index = f"{config.public_prefix}/css/style.css" if config.app_mode else "css/style.css"
     pages = {
         "messages": {
             "page": "messages", "file": None, "title": "Messages sent", "kicker": "Volume",
@@ -1423,10 +1760,21 @@ def render(all_data, config):
         local_chats = []
         for c in chats:
             same = c["folder"] == folder
-            urls = chat_urls(c["folder"], nav, relative=True) if same else {
-                f"{key}_url": f"../{c['folder']}/{page_filename(file_id)}"
-                for key, _label, file_id in nav
-            }
+            if config.app_mode:
+                prefix = config.public_prefix
+                urls = {
+                    f"{key}_url": (
+                        page_filename(file_id) if same
+                        else f"{prefix}/{c['folder']}/{page_filename(file_id)}"
+                    )
+                    for key, _label, file_id in nav
+                }
+                urls["messages_url"] = "index.html" if same else f"{prefix}/{c['folder']}/index.html"
+            else:
+                urls = chat_urls(c["folder"], nav, relative=True) if same else {
+                    f"{key}_url": f"../{c['folder']}/{page_filename(file_id)}"
+                    for key, _label, file_id in nav
+                }
             local_chats.append({**c, **urls})
         core_nav = [
             {**item, "href": page_filename(item["file"])}
@@ -1448,7 +1796,9 @@ def render(all_data, config):
             core_ids=core_ids,
             hours=payload.get("hours", []),
             weekdays=payload.get("weekdays", []),
-            css_href="../css/style.css",
+            css_href=css_page,
+            home_href=home_href or "../index.html",
+            home_label=home_label,
             tz_label=tz_label,
             filter_label=config.filter_label,
             generated=generated,
@@ -1509,11 +1859,21 @@ def render(all_data, config):
             )
             (chat_dir / "keywords.html").write_text(html)
 
+    group_chats = [c for c in chats if c.get("kind") != "dm"]
+    dm_chats = [c for c in chats if c.get("kind") == "dm"]
     index = Template(INDEX_TMPL).render(
         chats=chats,
+        group_chats=group_chats,
+        dm_chats=dm_chats,
         core_nav=core_meta,
         extra_groups=extra_meta,
-        css_href="css/style.css",
+        css_href=css_index,
+        home_href=home_href or "index.html",
+        home_label=home_label,
+        app_mode=config.app_mode,
+        report_index_href=(
+            f"{config.public_prefix}/index.html" if config.app_mode else "index.html"
+        ),
         tz_label=tz_label,
         filter_label=config.filter_label,
         export_formats=sorted(config.export_formats),
@@ -1804,6 +2164,38 @@ header h1 {
   margin-bottom: 12px;
 }
 .card h2 { font-size: 1.25rem; margin-bottom: 4px; }
+.card-top {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 4px;
+}
+.card-top h2 { margin: 0; }
+.badge {
+  display: inline-block;
+  font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  border: 1px solid var(--ink);
+  padding: 2px 6px;
+  vertical-align: middle;
+  margin-right: 4px;
+}
+.badge.group { background: var(--ink); color: var(--card); }
+.badge.dm { background: var(--card); color: var(--accent); border-color: var(--accent); }
+.section-label {
+  font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+  font-size: 0.72rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin: 28px 0 12px;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 6px;
+}
+.nav a .badge { margin-right: 6px; }
 .card p {
   font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
   color: var(--muted);
@@ -1905,8 +2297,9 @@ PAGE_TMPL = """<!DOCTYPE html>
       <h1>{{ chat_name }}</h1>
       <div class="page-title">{{ title }}</div>
       <div class="meta">
+        {% if chat_info.kind_subtitle %}{{ chat_info.kind_subtitle }} · {% endif %}
         {{ "{:,}".format(chat_info.total_messages) }} messages
-        · {{ chat_info.member_count }} people
+        {% if chat_info.kind != 'dm' %} · {{ chat_info.member_count }} people{% endif %}
         {% if chat_info.start_date and chat_info.end_date %}
         · {{ chat_info.start_date.strftime('%b %-d, %Y') }} – {{ chat_info.end_date.strftime('%b %-d, %Y') }}
         {% endif %}
@@ -1917,9 +2310,12 @@ PAGE_TMPL = """<!DOCTYPE html>
     </header>
 
     <nav class="nav">
-      <a href="../index.html">All chats</a>
+      <a href="{{ home_href }}">{{ home_label }}</a>
       {% for c in chats %}
-      <a href="{{ c.messages_url }}" class="{{ 'active' if c.name == chat_name else '' }}">{{ c.name }}</a>
+      <a href="{{ c.messages_url }}" class="{{ 'active' if c.name == chat_name else '' }}">
+        <span class="badge {{ 'dm' if c.kind == 'dm' else 'group' }}">{{ c.kind_badge }}</span>
+        {{ c.name }}
+      </a>
       {% endfor %}
     </nav>
     <nav class="subnav">
@@ -2088,27 +2484,36 @@ INDEX_TMPL = """<!DOCTYPE html>
       <div class="meta">{{ tz_label }}{% if filter_label %} · filter {{ filter_label }}{% endif %} · groups and 1:1 · tapbacks include Haha 😂, Love, Like, and !!{% if export_formats %} · exports: {{ export_formats|join(', ') }}{% endif %}</div>
     </header>
     <nav class="nav">
-      <a href="index.html" class="active">All chats</a>
+      {% if app_mode %}<a href="{{ home_href }}">{{ home_label }}</a>{% endif %}
+      <a href="{{ report_index_href }}" class="active">Reports</a>
       {% for c in chats %}
-      <a href="{{ c.messages_url }}">{{ c.name }}</a>
+      <a href="{{ c.messages_url }}">
+        <span class="badge {{ 'dm' if c.kind == 'dm' else 'group' }}">{{ c.kind_badge }}</span>
+        {{ c.name }}
+      </a>
       {% endfor %}
     </nav>
-    {% for c in chats %}
+
+    {% macro chat_card(c) %}
     <div class="card">
-      <h2>{{ c.name }}</h2>
-      <p>{{ "{:,}".format(c.total_messages) }} messages · {{ c.member_count }} people
+      <div class="card-top">
+        <span class="badge {{ 'dm' if c.kind == 'dm' else 'group' }}">{{ c.kind_badge }}</span>
+        <h2>{{ c.name }}</h2>
+      </div>
+      <p>{{ "{:,}".format(c.total_messages) }} messages{% if c.kind != 'dm' %} · {{ c.member_count }} people{% endif %}
          {% if c.start_date and c.end_date %}
          · {{ c.start_date.strftime('%b %Y') }} – {{ c.end_date.strftime('%b %Y') }}
-         {% endif %}</p>
+         {% endif %}
+         {% if c.kind_subtitle %} · {{ c.kind_subtitle }}{% endif %}</p>
       <div class="links core-links">
         {% for item in core_nav %}
         <a href="{{ c[item.key] }}">{{ item.label }}</a>
         {% endfor %}
         {% if 'csv' in export_formats %}
-        <a href="{{ c.folder }}/stats.csv">CSV</a>
+        <a href="{{ c.csv_url }}">CSV</a>
         {% endif %}
         {% if 'json' in export_formats %}
-        <a href="{{ c.folder }}/stats.json">JSON</a>
+        <a href="{{ c.json_url }}">JSON</a>
         {% endif %}
       </div>
       <details class="index-more">
@@ -2128,7 +2533,22 @@ INDEX_TMPL = """<!DOCTYPE html>
         </div>
       </details>
     </div>
-    {% endfor %}
+    {% endmacro %}
+
+    {% if group_chats %}
+    <h3 class="section-label">Group chats</h3>
+    {% for c in group_chats %}{{ chat_card(c) }}{% endfor %}
+    {% endif %}
+
+    {% if dm_chats %}
+    <h3 class="section-label">One-on-one</h3>
+    {% for c in dm_chats %}{{ chat_card(c) }}{% endfor %}
+    {% endif %}
+
+    {% if not group_chats and not dm_chats %}
+    {% for c in chats %}{{ chat_card(c) }}{% endfor %}
+    {% endif %}
+
     <footer>Generated {{ generated.strftime('%b %-d, %Y %-I:%M %p %Z') }}{% if export_formats %} · bulk exports in exports/{% endif %}</footer>
   </div>
 </body>
@@ -2158,7 +2578,11 @@ def main():
         help="Print group and 1:1 chat names from the database, then exit",
     )
     args = parser.parse_args()
-    config = Config(args)
+    try:
+        config = Config(args)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
     conn = get_connection(config.db_path)
 
     mapper = NameMapper(
@@ -2169,7 +2593,7 @@ def main():
     )
 
     if args.list_chats:
-        groups, dms = build_chat_index(conn, mapper)
+        groups, dms = build_chat_index(conn, mapper, tz=config.tz)
         conn.close()
         if not groups and not dms:
             print("No chats found.")
@@ -2179,6 +2603,7 @@ def main():
 
     if not config.target_gcs:
         print("No chats set. Put names in TARGET_GROUP_CHATS in .env, or pass --gcs.", file=sys.stderr)
+        print("Or run `python app.py` to pick a chat in the browser.", file=sys.stderr)
         print("Run `python analyze.py --list` to see groups and 1:1 chats.", file=sys.stderr)
         conn.close()
         sys.exit(1)
@@ -2193,33 +2618,19 @@ def main():
     if config.export_formats:
         print("Exports: " + ", ".join(sorted(config.export_formats)))
 
-    chats = find_chats(conn, config.target_gcs, mapper)
+    chats = find_chats(conn, config.target_gcs, mapper, tz=config.tz)
     if not chats:
         print("No matching chats found. Run `python analyze.py --list` to see names.", file=sys.stderr)
         conn.close()
         sys.exit(1)
 
-    all_data = {}
-    for name, chat_id in chats.items():
-        print(f"\n{name}")
-        messages, reactions = load_chat(conn, chat_id, config.tz)
-        before = len(messages)
-        messages, reactions = apply_date_filter(messages, reactions, config.since, config.until)
-        if config.filter_label:
-            print(f"  {len(messages):,}/{before:,} messages in range, {len(reactions):,} tapbacks")
-        else:
-            print(f"  {len(messages):,} messages, {len(reactions):,} tapbacks")
-        if messages.empty:
-            print("  Skipping — no messages in this date range")
-            continue
-        all_data[name] = compute_stats(messages, reactions, mapper, config.keywords)
-        print(f"  {all_data[name]['chat_info']['member_count']} people")
-
-    conn.close()
-    if not all_data:
-        print("No chats had messages in the selected range.", file=sys.stderr)
+    try:
+        out, exports, _ = analyze_chats(conn, mapper, chats, config)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        conn.close()
         sys.exit(1)
-    out, exports = render(all_data, config)
+    conn.close()
     print(f"\nWrote {out}")
     if exports:
         print(f"Exports ({len(exports)} files), including output/exports/")

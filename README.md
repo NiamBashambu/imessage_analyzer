@@ -1,6 +1,6 @@
 # iMessage chat leaderboard
 
-Local macOS tool. It reads your Messages database **read-only** and writes a static HTML site for any chats you pick — **group chats and 1:1s**.
+Local macOS tool. It reads your Messages database **read-only** and builds screenshotable leaderboards for **group chats and 1:1s**.
 
 Nothing is uploaded. Chats, contacts, and reports stay on your machine.
 
@@ -19,59 +19,61 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-**1. Full Disk Access** (required or `chat.db` cannot be read)
-
-System Settings → Privacy & Security → Full Disk Access → enable the app that will run Python (**Terminal**, **iTerm**, or **Cursor** — whichever you use). Quit and reopen that app after toggling it.
-
-**2. Find your chats**
-
-```bash
-python analyze.py --list
-```
-
-You’ll see two sections:
-
-- **GROUP CHATS** — named groups from Messages.app
-- **ONE-ON-ONE** — DMs, labeled with the contact’s first name (from Contacts)
-
-Copy names **exactly** as printed. Untitled groups won’t appear until you name them in Messages.
-
-**3. Edit `.env`** (required before the next step)
+Edit `.env` at least:
 
 ```
 YOUR_NAME=Alex
 TIMEZONE=America/Los_Angeles
-TARGET_GROUP_CHATS=Family Group,Roommates,Sam
 KEYWORDS=lol,lmao,omg,fr,bet
 ```
 
-Mix groups and 1:1 names in the same list. No quotes around the values.
+`TARGET_GROUP_CHATS` is only needed for the CLI batch mode. With the app, you pick chats in the browser.
 
-| Variable | What to put |
-| --- | --- |
-| `YOUR_NAME` | How you appear on the leaderboard |
-| `TIMEZONE` | [IANA zone](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones), e.g. `America/New_York` |
-| `TARGET_GROUP_CHATS` | Names from `--list` (groups **and** 1:1s), comma-separated |
-| `KEYWORDS` | Optional words to rank. Blank the line to hide that page |
+### 1. Full Disk Access
 
-`TARGET_CHATS` works as an alias for the same setting.
+Required or `chat.db` cannot be read.
 
-**4. Run and open**
+**System Settings → Privacy & Security → Full Disk Access** → enable the app that runs Python (**Terminal**, **iTerm**, or **Cursor**). Quit and reopen that app after toggling it.
+
+### 2. Launch the app
 
 ```bash
-python analyze.py
-open output/index.html
+python app.py
 ```
 
-The first run may ask for **Contacts** access. Allow it so phone numbers become names (especially for 1:1 labels).
+Browser opens [http://127.0.0.1:5050/](http://127.0.0.1:5050/).
 
-To screenshot a page without the nav: File → Print → Save as PDF (or print).
+- Tabs: **Group chats** / **One-on-one** (newest activity first, like Messages)
+- Search by name
+- Click a chat to analyze
+- **Options**: year / date range, keywords, CSV/JSON export
+
+Reports open under `/report/...`. Use **Pick chat** in the nav to choose another.
+
+The first run may ask for **Contacts** access — allow it so numbers become names.
+
+Change the port with `PORT=5050` in `.env` if needed.
+
+---
+
+## What the picker does
+
+| Behavior | Detail |
+| --- | --- |
+| **Spam / filtered** | Drops chats Apple marked Filtered Unknown Senders (`is_filtered`) |
+| **Unnamed groups** | Hides room threads with no display name (avoids fake “1:1s” with many people) |
+| **1:1 only** | Real DMs: Instant Message style, exactly one handle, not a `chat…` group id |
+| **Short codes** | Skips 4–6 digit blast / OTP-style SMS |
+| **Merge 1:1s** | Same Contacts person (phone + email) → one entry; analysis combines both threads |
+| **Merge groups** | Same display name → one entry (iMessage often creates a second room id for the same named group) |
+
+Unresolved Contacts still show as phone/email until you allow Contacts or add an `aliases.json` mapping.
 
 ---
 
 ## What you get
 
-One folder per chat. The main row is five pages; everything else is under **More stats**. Open **Key** on any page for how to read the numbers.
+One folder per chat under `output/`. Main row: Messages, Received, Given, Pace, When. Everything else is under **More stats**. Open **Key** on any page for how to read the numbers.
 
 | Main | What it ranks |
 | --- | --- |
@@ -89,37 +91,73 @@ One folder per chat. The main row is five pages; everything else is under **More
 | **Nights / Mornings / Weekends / Week** | Late-night, 5–10am, Sat–Sun, weekday |
 | **Links / Emoji** | URLs, emoji volume |
 | **Veterans / Ghosts** | Longest tenure, days since last text |
-| **Keywords** | Who said each word (set `KEYWORDS` in `.env`) |
+| **Keywords** | Who said each word (set `KEYWORDS` or Options) |
 
-Names come from macOS Contacts. Nicknames like Mike / Mikey / Michael are merged. Country codes like `+1` are ignored when matching phones. If two different people in the same chat share a first name, labels become **First L.** (or **First Last** if the initial still clashes).
+Names come from macOS Contacts. Nicknames like Mike / Mikey / Michael are merged. If two different people in the same chat share a first name, labels become **First L.** (or **First Last** if the initial still clashes). Reports show a **Group** or **1:1** badge.
 
 ---
 
-## Optional
+## Setup reference
+
+| Variable | Required | What to put |
+| --- | --- | --- |
+| `YOUR_NAME` | Yes | How you appear on the leaderboard |
+| `TIMEZONE` | Yes | [IANA zone](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones) |
+| `KEYWORDS` | No | Words to rank (comma-separated) |
+| `EXPORT` | No | `csv,json` (default), `csv`, `json`, or `none` |
+| `TARGET_GROUP_CHATS` | CLI only | Names from `python analyze.py --list` |
+| `YEAR` / `SINCE` / `UNTIL` | No | Date filters for CLI (app uses Options) |
+| `PORT` | No | App port (default `5050`) |
+| `DB_PATH` | No | Default `~/Library/Messages/chat.db` |
+| `ALIASES_FILE` | No | Path to phone/email → name overrides |
+
+Copy `.env.example` → `.env`. Never commit `.env`.
+
+### Override a name Contacts missed
+
+```bash
+cp aliases.example.json aliases.json
+```
+
+```json
+{
+  "+15551234567": "Sam",
+  "friend@icloud.com": "Jordan"
+}
+```
+
+### Rebuild name cache
+
+```bash
+rm -f data/name_cache.json data/contacts_dump.json
+python app.py
+```
+
+---
+
+## Batch / CLI (optional)
+
+For scripting or analyzing several chats at once:
+
+```bash
+python analyze.py --list
+```
+
+Put names in `TARGET_GROUP_CHATS` (groups and 1:1s), then:
+
+```bash
+python analyze.py
+open output/index.html
+```
 
 ### Date filters
-
-Limit stats to a year or range (in your `TIMEZONE`):
 
 ```bash
 python analyze.py --year 2025
 python analyze.py --since 2024-06-01 --until 2025-12-31
 ```
 
-Or in `.env`:
-
-```
-YEAR=2025
-```
-
-or
-
-```
-SINCE=2024-06-01
-UNTIL=2025-12-31
-```
-
-Use **either** `YEAR` **or** `SINCE`/`UNTIL`, not both. The active filter is shown on every page.
+Or set `YEAR` / `SINCE` / `UNTIL` in `.env`. In the app, use **Options**.
 
 ### Exports (CSV / JSON)
 
@@ -135,30 +173,10 @@ By default each run writes:
 
 ```bash
 python analyze.py --export csv
-python analyze.py --export json
 python analyze.py --export none
 ```
 
-Or set `EXPORT=csv,json` / `EXPORT=none` in `.env`. Index cards link to each chat’s CSV/JSON when enabled.
-
-### Override a name Contacts missed
-
-```bash
-cp aliases.example.json aliases.json
-```
-
-```json
-{
-  "+15551234567": "Sam",
-  "friend@icloud.com": "Jordan"
-}
-```
-
-Then rerun `python analyze.py`. Useful when a 1:1 still shows a phone number in `--list`.
-
-### CLI flags
-
-These override `.env` for one run:
+### Useful flags
 
 ```bash
 python analyze.py --list
@@ -167,17 +185,6 @@ python analyze.py --year 2025
 python analyze.py --since 2024-01-01 --until 2024-12-31
 python analyze.py --keywords "lol,bet,down bad"
 python analyze.py --export csv,json
-python analyze.py --outdir ./output
-python analyze.py --db ~/Library/Messages/chat.db
-```
-
-### Rebuild name cache
-
-If someone still shows up wrong, delete the local cache and rerun:
-
-```bash
-rm -f data/name_cache.json data/contacts_dump.json
-python analyze.py
 ```
 
 ---
@@ -186,49 +193,31 @@ python analyze.py
 
 | Problem | Fix |
 | --- | --- |
-| `cannot read chat.db` / Full Disk Access error | Grant FDA to the app running Python, then **quit and reopen** it. Cursor and Terminal are separate apps. |
-| `No chats set` | Put names in `TARGET_GROUP_CHATS` or pass `--gcs`. Run `--list` first. |
-| `no chat named …` | Names must match `--list`. For 1:1s use the contact first name shown there. Untitled groups need a name in Messages. |
+| `cannot read chat.db` | Grant Full Disk Access to the app running Python, then quit and reopen it. |
+| App won’t open chats | Same FDA rule — Cursor and Terminal are separate apps. |
+| `No chats set` (CLI) | Use `app.py`, or set `TARGET_GROUP_CHATS` / `--gcs`. |
 | 1:1 shows a phone number | Allow Contacts, or map it in `aliases.json`. |
-| Everyone is “Unknown” / raw numbers | Allow Contacts on first run. Add misses to `aliases.json`. |
-| Keywords page missing | Set `KEYWORDS` in `.env` or pass `--keywords`. |
-| Date filter empty | Widen `SINCE`/`UNTIL`/`YEAR`, or drop the filter. |
-| No CSV/JSON | Set `EXPORT=csv,json` (default) or pass `--export csv,json`. |
-| Times look wrong | Set `TIMEZONE` to your IANA zone. Optional `TIMEZONE_LABEL` for a custom label. |
-| `ModuleNotFoundError` | Activate the venv and `pip install -r requirements.txt`. |
+| Duplicate group names | Same-named rooms are merged automatically; restart `app.py` after pulling updates. |
+| Spam / random people in 1:1 | Filtered Unknown Senders, short codes, and unnamed groups are excluded; restart the app. |
+| Date filter empty | Widen the range or clear Options / env filters. |
+| Stale picker list | Restart `python app.py` (no auto-reload unless you restart). |
 
 ---
 
 ## Privacy
 
-Never commit:
-
-- `.env`
-- `aliases.json`
-- `data/name_cache.json` / `data/contacts_dump.json`
-- `output/`
-- any `chat.db`
-
-`.gitignore` already covers these. `output/` is wiped and rebuilt on every run.
+Never commit `.env`, `aliases.json`, `data/*cache*`, `output/`, or any `chat.db`. `.gitignore` already covers these.
 
 ---
 
 ## Layout
 
 ```
-analyze.py              entry point
+app.py                  local web app (pick Group vs 1:1)
+analyze.py              CLI + shared analyze/render pipeline
 src/name_mapper.py      Contacts + nickname merging
-.env.example            copy to .env (gitignored)
-aliases.example.json    copy to aliases.json if needed
-data/                   local cache (not committed)
-output/                 generated site (wiped each run)
-  index.html
-  css/style.css
-  family_group/
-    index.html          messages
-    received.html
-    …
-  sam/                  1:1 example
-    index.html
-    …
+.env.example            copy to .env
+aliases.example.json    sample name overrides
+data/                   local Contacts dump + name cache (gitignored)
+output/                 generated reports (wiped each analyze)
 ```
