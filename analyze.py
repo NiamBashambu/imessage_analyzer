@@ -2,13 +2,15 @@
 """Group chat leaderboard — screenshotable pages for messages and tapbacks."""
 
 import argparse
+import csv
+import json
 import os
 import re
 import shutil
 import sqlite3
 import sys
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -17,7 +19,7 @@ from dotenv import load_dotenv
 from jinja2 import Template
 
 sys.path.insert(0, str(Path(__file__).parent))
-from src.name_mapper import NameMapper
+from src.name_mapper import NameMapper, canonical_first_name, build_chat_labeler
 
 # 2000–2007 are tapbacks; 3000s are removals
 TAPBACK_RANGE = range(2000, 2008)
@@ -33,6 +35,43 @@ REACT_LABEL = {
     2007: "other",
 }
 
+EXPORT_FIELDS = [
+    "name",
+    "message_count",
+    "percentage",
+    "avg_per_day",
+    "tapbacks_got",
+    "tapbacks_given",
+    "tapbacks_per_100",
+    "given_per_100",
+    "balance",
+    "haha_got",
+    "haha_given",
+    "loved_got",
+    "liked_got",
+    "days_active",
+    "streak",
+    "peak_day",
+    "days_opened",
+    "days_closed",
+    "night_pct",
+    "morning_pct",
+    "weekend_pct",
+    "kickoffs",
+    "bursts",
+    "followups",
+    "questions",
+    "links",
+    "emoji_count",
+    "reply_median_min",
+    "reply_count",
+    "recent",
+    "peak_hour",
+    "peak_weekday",
+    "first_label",
+    "last_label",
+]
+
 
 def slug(name):
     return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
@@ -46,6 +85,14 @@ def hour_label(h):
     if h == 12:
         return "12pm"
     return f"{h - 12}pm"
+
+
+def _parse_ymd(raw, label):
+    try:
+        return datetime.strptime(raw.strip(), "%Y-%m-%d")
+    except ValueError:
+        print(f"Error: {label} must be YYYY-MM-DD (got {raw!r})", file=sys.stderr)
+        sys.exit(1)
 
 
 class Config:
@@ -64,13 +111,73 @@ class Config:
             print(f"Error: unknown TIMEZONE {tz_name!r}. Use an IANA name like America/New_York.", file=sys.stderr)
             sys.exit(1)
         self.tz_label = os.getenv("TIMEZONE_LABEL") or _friendly_tz_label(tz_name, self.tz)
-        raw = args.gcs or os.getenv("TARGET_GROUP_CHATS", "")
+        raw = args.gcs or os.getenv("TARGET_CHATS") or os.getenv("TARGET_GROUP_CHATS", "")
         self.target_gcs = [g.strip() for g in raw.split(",") if g.strip()]
         kw_raw = getattr(args, "keywords", None) or os.getenv("KEYWORDS", "")
         self.keywords = [w.strip() for w in kw_raw.split(",") if w.strip()]
+        self.since, self.until, self.filter_label = self._parse_date_filter(args)
+        export_raw = getattr(args, "export", None)
+        if export_raw is None:
+            export_raw = os.getenv("EXPORT", "csv,json")
+        self.export_formats = self._parse_export(export_raw)
 
     def _expand(self, p):
         return Path(p).expanduser().resolve()
+
+    def _parse_export(self, raw):
+        if raw is None:
+            return {"csv", "json"}
+        text = str(raw).strip().lower()
+        if text in ("", "none", "off", "false", "0"):
+            return set()
+        parts = {p.strip() for p in text.split(",") if p.strip()}
+        bad = parts - {"csv", "json"}
+        if bad:
+            print(f"Error: unknown EXPORT format(s): {', '.join(sorted(bad))} (use csv, json, or none)", file=sys.stderr)
+            sys.exit(1)
+        return parts
+
+    def _parse_date_filter(self, args):
+        year = getattr(args, "year", None)
+        if year is None:
+            year_env = os.getenv("YEAR", "").strip()
+            year = int(year_env) if year_env else None
+        since_raw = getattr(args, "since", None) or os.getenv("SINCE", "").strip() or None
+        until_raw = getattr(args, "until", None) or os.getenv("UNTIL", "").strip() or None
+
+        since = until = None
+        if year is not None:
+            if since_raw or until_raw:
+                print("Error: use YEAR alone, or SINCE/UNTIL — not both.", file=sys.stderr)
+                sys.exit(1)
+            since = self.tz.localize(datetime(int(year), 1, 1, 0, 0, 0))
+            until = self.tz.localize(datetime(int(year) + 1, 1, 1, 0, 0, 0))
+            return since, until, str(int(year))
+
+        if since_raw:
+            since = self.tz.localize(_parse_ymd(since_raw, "SINCE/--since"))
+        if until_raw:
+            # inclusive calendar day → start of next day (exclusive)
+            day = _parse_ymd(until_raw, "UNTIL/--until")
+            until = self.tz.localize(day + timedelta(days=1))
+
+        if since and until and since >= until:
+            print("Error: SINCE must be before UNTIL.", file=sys.stderr)
+            sys.exit(1)
+
+        if not since and not until:
+            return None, None, None
+
+        def fmt(ts):
+            return ts.strftime("%b %-d, %Y")
+
+        if since and until:
+            label = f"{fmt(since)} – {fmt(until - timedelta(seconds=1))}"
+        elif since:
+            label = f"from {fmt(since)}"
+        else:
+            label = f"through {fmt(until - timedelta(seconds=1))}"
+        return since, until, label
 
 
 def _friendly_tz_label(tz_name, tz):
@@ -83,6 +190,22 @@ def _friendly_tz_label(tz_name, tz):
     if tz_name in ("America/Denver", "US/Mountain"):
         return "Mountain Time"
     return tz.tzname(datetime.now())
+
+
+URL_RE = re.compile(r"(https?://\S+|www\.\S+)", re.IGNORECASE)
+# Broad emoji / symbol ranges used in iMessage
+EMOJI_RE = re.compile(
+    "["
+    "\U0001F300-\U0001FAFF"
+    "\U00002600-\U000027BF"
+    "\U0001F1E0-\U0001F1FF"
+    "\U00002702-\U000027B0"
+    "\U000024C2-\U0001F251"
+    "]+",
+    flags=re.UNICODE,
+)
+SILENCE_HOURS = 2  # gap that counts as a new conversation kickoff
+REPLY_MAX_HOURS = 12  # ignore gaps longer than this as "replies"
 
 
 def get_connection(db_path):
@@ -98,37 +221,152 @@ def get_connection(db_path):
         sys.exit(1)
 
 
-def list_group_chats(conn):
+def load_chat_catalog(conn):
+    """All chats with message counts, classified as group or dm."""
     return pd.read_sql_query(
         """
-        SELECT c.display_name AS name, COUNT(*) AS messages
+        SELECT c.ROWID AS chat_id,
+               c.display_name AS display_name,
+               c.chat_identifier AS chat_identifier,
+               c.style AS style,
+               COUNT(cmj.message_id) AS messages,
+               (
+                 SELECT h.id FROM chat_handle_join chj
+                 JOIN handle h ON h.ROWID = chj.handle_id
+                 WHERE chj.chat_id = c.ROWID
+                 LIMIT 1
+               ) AS peer_id
         FROM chat c
         JOIN chat_message_join cmj ON c.ROWID = cmj.chat_id
-        WHERE c.display_name IS NOT NULL AND c.display_name != ''
         GROUP BY c.ROWID
+        HAVING messages > 0
         ORDER BY messages DESC
         """,
         conn,
     )
 
 
-def find_chats(conn, names):
-    df = pd.read_sql_query(
-        "SELECT ROWID, display_name FROM chat WHERE display_name IS NOT NULL AND display_name != ''",
-        conn,
-    )
+def is_dm_row(row):
+    style = row.get("style")
+    name = (row.get("display_name") or "").strip()
+    if style == 45:
+        return True
+    if not name and row.get("peer_id") and not str(row.get("chat_identifier") or "").startswith("chat"):
+        return True
+    return False
+
+
+def dm_labels(mapper, identifier):
+    """Return (list_label, match_keys) for a 1:1 peer."""
+    ident = str(identifier or "").strip()
+    resolved = mapper.resolve(ident) if ident else None
+    first = canonical_first_name(resolved) if resolved else None
+    keys = set()
+    if ident:
+        keys.add(ident.lower())
+    if resolved:
+        keys.add(resolved.lower())
+        keys.add(canonical_first_name(resolved).lower())
+    if first:
+        keys.add(first.lower())
+    label = first or resolved or ident or "Unknown"
+    return label, keys, resolved
+
+
+def build_chat_index(conn, mapper):
+    """Catalog with stable display titles for groups and 1:1s."""
+    catalog = load_chat_catalog(conn)
+    groups = []
+    dms = []
+    used_dm_labels = defaultdict(int)
+
+    for _, row in catalog.iterrows():
+        if is_dm_row(row):
+            label, keys, resolved = dm_labels(mapper, row["peer_id"] or row["chat_identifier"])
+            used_dm_labels[label.lower()] += 1
+            dms.append({
+                "chat_id": int(row["chat_id"]),
+                "kind": "dm",
+                "label": label,
+                "resolved": resolved,
+                "identifier": row["peer_id"] or row["chat_identifier"],
+                "messages": int(row["messages"]),
+                "keys": keys,
+            })
+        else:
+            name = (row["display_name"] or "").strip()
+            if not name:
+                continue
+            groups.append({
+                "chat_id": int(row["chat_id"]),
+                "kind": "group",
+                "label": name,
+                "messages": int(row["messages"]),
+                "keys": {name.lower()},
+            })
+
+    # Disambiguate duplicate first names among DMs
+    for dm in dms:
+        if used_dm_labels[dm["label"].lower()] > 1 and dm["identifier"]:
+            short = str(dm["identifier"])
+            if len(short) > 18:
+                short = short[:14] + "…"
+            dm["label"] = f"{dm['label']} ({short})"
+            dm["keys"].add(dm["label"].lower())
+
+    return groups, dms
+
+
+def print_chat_list(groups, dms):
+    print("GROUP CHATS")
+    print(f"{'Messages':>10}  Name (use this in TARGET_GROUP_CHATS)")
+    print("-" * 56)
+    if not groups:
+        print("  (none)")
+    for g in groups:
+        print(f"{g['messages']:>10,}  {g['label']}")
+
+    print("\nONE-ON-ONE")
+    print(f"{'Messages':>10}  Name (use this in TARGET_GROUP_CHATS)")
+    print("-" * 56)
+    if not dms:
+        print("  (none)")
+    for d in dms[:80]:
+        print(f"{d['messages']:>10,}  {d['label']}")
+    if len(dms) > 80:
+        print(f"  … and {len(dms) - 80} more")
+
+    print("\nCopy names into TARGET_GROUP_CHATS in .env (comma-separated).")
+    print("Groups and 1:1 chats both work. Spelling must match the Name column.")
+
+
+def find_chats(conn, names, mapper):
+    groups, dms = build_chat_index(conn, mapper)
+    catalog = groups + dms
     found = {}
     for name in names:
-        hits = df[df["display_name"].str.lower() == name.lower()]
-        if len(hits):
-            found[hits.iloc[0]["display_name"]] = int(hits.iloc[0]["ROWID"])
-        else:
+        needle = name.strip().lower()
+        if not needle:
+            continue
+        matches = [c for c in catalog if needle in c["keys"] or needle == c["label"].lower()]
+        if not matches:
+            # substring fallback on labels
+            matches = [c for c in catalog if needle in c["label"].lower()]
+        if not matches:
             print(f"  Warning: no chat named {name!r}")
-            close = df[df["display_name"].str.lower().str.contains(name.lower(), na=False)]
-            if len(close):
+            close = [c for c in catalog if needle[:4] in c["label"].lower()][:5] if len(needle) >= 4 else []
+            if close:
                 print("    Did you mean:")
-                for n in close["display_name"].head(5):
-                    print(f"      - {n}")
+                for c in close:
+                    print(f"      - {c['label']}")
+            continue
+        # Prefer exact key match, then most messages
+        exact = [c for c in matches if needle in c["keys"] or needle == c["label"].lower()]
+        pick = max(exact or matches, key=lambda c: c["messages"])
+        title = pick["label"]
+        if title in found and found[title] != pick["chat_id"]:
+            title = f"{title} · {pick['chat_id']}"
+        found[title] = pick["chat_id"]
     return found
 
 
@@ -216,7 +454,7 @@ def load_chat(conn, chat_id, tz):
     reactions = pd.read_sql_query(
         f"""
         SELECT m.associated_message_guid, m.associated_message_type,
-               h.id AS reactor_handle_id, m.is_from_me AS reactor_is_me
+               h.id AS reactor_handle_id, m.is_from_me AS reactor_is_me, m.date
         FROM message m
         LEFT JOIN handle h ON m.handle_id = h.ROWID
         JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
@@ -226,7 +464,30 @@ def load_chat(conn, chat_id, tz):
         """,
         conn,
     )
+    if not reactions.empty:
+        reactions["datetime"] = reactions["date"].apply(lambda v: convert_timestamp(v, tz))
     return real, reactions
+
+
+def apply_date_filter(messages, reactions, since, until):
+    """Keep rows in [since, until)."""
+    if since is None and until is None:
+        return messages, reactions
+    if not messages.empty:
+        mask = pd.Series(True, index=messages.index)
+        if since is not None:
+            mask &= messages["datetime"] >= since
+        if until is not None:
+            mask &= messages["datetime"] < until
+        messages = messages.loc[mask].copy()
+    if reactions is not None and not reactions.empty and "datetime" in reactions.columns:
+        mask = pd.Series(True, index=reactions.index)
+        if since is not None:
+            mask &= reactions["datetime"] >= since
+        if until is not None:
+            mask &= reactions["datetime"] < until
+        reactions = reactions.loc[mask].copy()
+    return messages, reactions
 
 
 def longest_streak(dates):
@@ -276,6 +537,13 @@ def compute_stats(messages, reactions, mapper, keywords=None):
             "days_opened": 0,
             "days_closed": 0,
             "followups": 0,
+            "questions": 0,
+            "links": 0,
+            "emoji_count": 0,
+            "emoji_msgs": 0,
+            "kickoffs": 0,
+            "bursts": 0,
+            "reply_gaps": [],
         }
 
     stats = defaultdict(blank)
@@ -289,8 +557,15 @@ def compute_stats(messages, reactions, mapper, keywords=None):
     kw_msgs = defaultdict(lambda: defaultdict(int))
     readable = 0
 
+    handle_pairs = []
     for _, row in messages.iterrows():
-        name = mapper.display_name(row["handle_id"], bool(row["is_from_me"]))
+        handle_pairs.append((row["handle_id"], bool(row["is_from_me"])))
+    for _, row in reactions.iterrows():
+        handle_pairs.append((row["reactor_handle_id"], bool(row["reactor_is_me"])))
+    label_of = build_chat_labeler(mapper, handle_pairs)
+
+    for _, row in messages.iterrows():
+        name = label_of(row["handle_id"], bool(row["is_from_me"]))
         if not name:
             skipped += 1
             continue
@@ -334,15 +609,39 @@ def compute_stats(messages, reactions, mapper, keywords=None):
                 if found:
                     kw_hits[name][word] += len(found)
                     kw_msgs[name][word] += 1
+            if "?" in body:
+                stats[name]["questions"] += 1
+            if URL_RE.search(body):
+                stats[name]["links"] += 1
+            emojis = EMOJI_RE.findall(body)
+            if emojis:
+                stats[name]["emoji_msgs"] += 1
+                stats[name]["emoji_count"] += sum(len(e) for e in emojis)
 
     timed.sort(key=lambda x: x[0])
     by_day = defaultdict(list)
     prev = None
+    prev_dt = None
+    run_len = 0
+    silence = pd.Timedelta(hours=SILENCE_HOURS)
+    reply_cap = pd.Timedelta(hours=REPLY_MAX_HOURS)
     for dt, name in timed:
         by_day[dt.date()].append(name)
+        if prev_dt is None or (dt - prev_dt) >= silence:
+            stats[name]["kickoffs"] += 1
         if name == prev:
             stats[name]["followups"] += 1
+            run_len += 1
+            if run_len == 3:
+                stats[name]["bursts"] += 1
+        else:
+            if prev is not None and prev_dt is not None:
+                gap = dt - prev_dt
+                if pd.Timedelta(0) < gap <= reply_cap:
+                    stats[name]["reply_gaps"].append(gap.total_seconds())
+            run_len = 1
         prev = name
+        prev_dt = dt
     for names in by_day.values():
         stats[names[0]]["days_opened"] += 1
         stats[names[-1]]["days_closed"] += 1
@@ -350,7 +649,7 @@ def compute_stats(messages, reactions, mapper, keywords=None):
     matched = 0
     for _, row in reactions.iterrows():
         kind = REACT_LABEL.get(int(row["associated_message_type"]) if pd.notna(row["associated_message_type"]) else -1, "other")
-        giver = mapper.display_name(row["reactor_handle_id"], bool(row["reactor_is_me"]))
+        giver = label_of(row["reactor_handle_id"], bool(row["reactor_is_me"]))
         if giver:
             stats[giver]["tapbacks_given"] += 1
             if kind == "haha":
@@ -445,6 +744,21 @@ def compute_stats(messages, reactions, mapper, keywords=None):
             "followup_pct": (s["followups"] / n * 100) if n else 0,
             "recent": s["recent"],
             "recent_pct": (s["recent"] / n * 100) if n else 0,
+            "questions": s["questions"],
+            "question_pct": (s["questions"] / n * 100) if n else 0,
+            "links": s["links"],
+            "link_pct": (s["links"] / n * 100) if n else 0,
+            "emoji_count": s["emoji_count"],
+            "emoji_msgs": s["emoji_msgs"],
+            "emoji_per_100": (s["emoji_count"] / n * 100) if n else 0,
+            "kickoffs": s["kickoffs"],
+            "kickoff_pct": (s["kickoffs"] / n * 100) if n else 0,
+            "bursts": s["bursts"],
+            "burst_pct": (s["bursts"] / n * 100) if n else 0,
+            "reply_count": len(s["reply_gaps"]),
+            "reply_median_min": (
+                float(pd.Series(s["reply_gaps"]).median() / 60.0) if s["reply_gaps"] else None
+            ),
         })
 
     max_hour = max(hours.values()) if hours else 1
@@ -529,14 +843,21 @@ EXTRA_GROUPS = [
         ("peaks", "Peaks", "peaks", "Most messages in one day"),
         ("recent", "Recent", "recent", "Last 30 days"),
         ("rambles", "Rambles", "rambles", "Back-to-back texts"),
+        ("bursts", "Bursts", "bursts", "Streaks of 3+ texts in a row"),
     ]),
     ("Timing", [
         ("openers", "Openers", "openers", "First text of each day"),
         ("closers", "Closers", "closers", "Last text of each day"),
+        ("kickoffs", "Kickoffs", "kickoffs", f"First text after {SILENCE_HOURS}h+ silence"),
+        ("replies", "Replies", "replies", "Fastest median reply time"),
         ("nights", "Nights", "nights", "Share sent 10pm–5am"),
         ("mornings", "Mornings", "mornings", "Share sent 5–10am"),
         ("weekends", "Weekends", "weekends", "Share sent Sat–Sun"),
         ("week", "Week", "week", "Messages by weekday"),
+    ]),
+    ("Content", [
+        ("links", "Links", "links", "Texts with a URL"),
+        ("emoji", "Emoji", "emoji", "Emoji characters sent"),
     ]),
     ("Tenure", [
         ("veterans", "Veterans", "veterans", "Longest time in the chat"),
@@ -594,14 +915,30 @@ def chat_urls(folder, pages, relative=False):
     return urls
 
 
-def ranked(members, key):
-    rows = sorted(members, key=lambda m: m[key], reverse=True)
-    top = rows[0][key] if rows and rows[0][key] else 1
+def ranked(members, key, ascending=False):
+    def sort_key(m):
+        v = m.get(key)
+        if v is None:
+            return (1, 0)
+        return (0, v if ascending else -v)
+
+    rows = sorted(members, key=sort_key)
+    values = [m[key] for m in rows if m.get(key) is not None]
+    if ascending:
+        best = min(values) if values else 1
+    else:
+        best = max(values) if values else 1
     out = []
     for i, m in enumerate(rows, 1):
         item = dict(m)
         item["rank"] = i
-        item["bar_pct"] = (m[key] / top * 100) if top else 0
+        v = m.get(key)
+        if v is None or not best:
+            item["bar_pct"] = 0
+        elif ascending:
+            item["bar_pct"] = (best / v * 100) if v else 0
+        else:
+            item["bar_pct"] = (v / best * 100) if best else 0
         out.append(item)
     return out
 
@@ -610,6 +947,122 @@ def wipe_output(output_dir):
     if output_dir.exists():
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True)
+
+
+def _json_safe(value):
+    if value is None:
+        return None
+    if isinstance(value, float) and pd.isna(value):
+        return None
+    if isinstance(value, (pd.Timestamp, datetime)):
+        return value.isoformat()
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    return value
+
+
+def members_table(chat_name, members):
+    rows = []
+    for m in members:
+        row = {"chat": chat_name}
+        for key in EXPORT_FIELDS:
+            row[key] = _json_safe(m.get(key))
+        rows.append(row)
+    return rows
+
+
+def write_exports(all_data, config):
+    if not config.export_formats:
+        return []
+    export_dir = config.output_dir / "exports"
+    export_dir.mkdir(parents=True, exist_ok=True)
+    written = []
+    all_rows = []
+    chat_rows = []
+
+    for chat_name, payload in all_data.items():
+        folder = slug(chat_name)
+        chat_dir = config.output_dir / folder
+        chat_dir.mkdir(parents=True, exist_ok=True)
+        info = payload.get("chat_info", {})
+        members = payload.get("members", [])
+        rows = members_table(chat_name, members)
+        all_rows.extend(rows)
+        chat_rows.append({
+            "chat": chat_name,
+            "folder": folder,
+            "total_messages": info.get("total_messages", 0),
+            "member_count": info.get("member_count", 0),
+            "start_date": _json_safe(info.get("start_date")),
+            "end_date": _json_safe(info.get("end_date")),
+            "filter": config.filter_label,
+        })
+
+        payload_out = {
+            "chat": chat_name,
+            "filter": config.filter_label,
+            "timezone": config.tz_label,
+            "chat_info": {k: _json_safe(v) for k, v in info.items()},
+            "members": [{k: _json_safe(m.get(k)) for k in EXPORT_FIELDS} for m in members],
+            "keywords": [
+                {
+                    "word": b["word"],
+                    "total": b["total"],
+                    "messages": b["messages"],
+                    "members": [
+                        {
+                            "name": m["name"],
+                            "kw_hits": m.get("kw_hits", 0),
+                            "kw_msgs": m.get("kw_msgs", 0),
+                            "kw_per_100": _json_safe(m.get("kw_per_100")),
+                        }
+                        for m in b.get("members", [])
+                    ],
+                }
+                for b in payload.get("keyword_boards", [])
+            ],
+        }
+
+        if "csv" in config.export_formats:
+            path = chat_dir / "stats.csv"
+            with path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=["chat"] + EXPORT_FIELDS)
+                writer.writeheader()
+                writer.writerows(rows)
+            written.append(path)
+        if "json" in config.export_formats:
+            path = chat_dir / "stats.json"
+            path.write_text(json.dumps(payload_out, indent=2))
+            written.append(path)
+
+    if "csv" in config.export_formats:
+        path = export_dir / "members.csv"
+        with path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["chat"] + EXPORT_FIELDS)
+            writer.writeheader()
+            writer.writerows(all_rows)
+        written.append(path)
+        path = export_dir / "chats.csv"
+        fields = ["chat", "folder", "total_messages", "member_count", "start_date", "end_date", "filter"]
+        with path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(chat_rows)
+        written.append(path)
+    if "json" in config.export_formats:
+        path = export_dir / "all.json"
+        path.write_text(json.dumps({
+            "filter": config.filter_label,
+            "timezone": config.tz_label,
+            "generated": datetime.now(config.tz).isoformat(),
+            "chats": chat_rows,
+            "members": all_rows,
+        }, indent=2))
+        written.append(path)
+    return written
 
 
 def render(all_data, config):
@@ -904,6 +1357,62 @@ def render(all_data, config):
                 ("message_count", "int", "Total messages"),
             ],
         },
+        "bursts": {
+            "page": "bursts", "file": "bursts", "title": "Triple-text bursts", "kicker": "Bursts",
+            "blurb": "How often they sent 3 or more messages in a row before anyone else replied.",
+            "value_key": "bursts", "value_fmt": "int",
+            "share_key": "burst_pct", "share_suffix": "bursts / 100 messages",
+            "cols": [
+                ("bursts", "int", "Bursts of 3+"),
+                ("followups", "int", "All follow-ups"),
+                ("message_count", "int", "Messages"),
+            ],
+        },
+        "kickoffs": {
+            "page": "kickoffs", "file": "kickoffs", "title": "Who restarts the chat", "kicker": "Kickoffs",
+            "blurb": f"First message after {SILENCE_HOURS}+ hours of silence in the thread.",
+            "value_key": "kickoffs", "value_fmt": "int",
+            "share_key": "kickoff_pct", "share_suffix": "kickoffs / 100 messages",
+            "cols": [
+                ("kickoffs", "int", "Kickoffs"),
+                ("days_opened", "int", "Days opened"),
+                ("message_count", "int", "Messages"),
+            ],
+        },
+        "replies": {
+            "page": "replies", "file": "replies", "title": "Fastest replies", "kicker": "Speed",
+            "blurb": f"Median minutes to reply after someone else texted (gaps under {REPLY_MAX_HOURS} hours). Lower is faster.",
+            "value_key": "reply_median_min", "value_fmt": "num",
+            "share_key": "reply_count", "share_suffix": "timed replies", "share_fmt": "int",
+            "ascending": True,
+            "cols": [
+                ("reply_median_min", "num", "Median reply (min)"),
+                ("reply_count", "int", "Timed replies"),
+                ("message_count", "int", "Messages"),
+            ],
+        },
+        "links": {
+            "page": "links", "file": "links", "title": "Link droppers", "kicker": "URLs",
+            "blurb": "Messages that include a link (http/https or www).",
+            "value_key": "links", "value_fmt": "int",
+            "share_key": "link_pct", "share_suffix": "% of their messages",
+            "cols": [
+                ("links", "int", "Link messages"),
+                ("link_pct", "pct", "% of messages"),
+                ("message_count", "int", "Messages"),
+            ],
+        },
+        "emoji": {
+            "page": "emoji", "file": "emoji", "title": "Emoji volume", "kicker": "Emoji",
+            "blurb": "Total emoji characters sent. Per 100 = emoji chars ÷ messages × 100.",
+            "value_key": "emoji_count", "value_fmt": "int",
+            "share_key": "emoji_per_100", "share_suffix": "emoji chars / 100 messages",
+            "cols": [
+                ("emoji_count", "int", "Emoji characters"),
+                ("emoji_msgs", "int", "Messages with emoji"),
+                ("emoji_per_100", "num", "Per 100 messages"),
+            ],
+        },
     }
 
     page_t = Template(PAGE_TMPL)
@@ -941,10 +1450,15 @@ def render(all_data, config):
             weekdays=payload.get("weekdays", []),
             css_href="../css/style.css",
             tz_label=tz_label,
+            filter_label=config.filter_label,
             generated=generated,
         )
         for spec in pages.values():
-            members = ranked(payload["members"], spec["value_key"])
+            members = ranked(
+                payload["members"],
+                spec["value_key"],
+                ascending=spec.get("ascending", False),
+            )
             filename = page_filename(spec.get("file"))
             html = page_t.render(
                 **page_kwargs,
@@ -1001,11 +1515,14 @@ def render(all_data, config):
         extra_groups=extra_meta,
         css_href="css/style.css",
         tz_label=tz_label,
+        filter_label=config.filter_label,
+        export_formats=sorted(config.export_formats),
         generated=generated,
     )
     path = config.output_dir / "index.html"
     path.write_text(index)
-    return path
+    exports = write_exports(all_data, config)
+    return path, exports
 
 
 CSS = """
@@ -1390,8 +1907,11 @@ PAGE_TMPL = """<!DOCTYPE html>
       <div class="meta">
         {{ "{:,}".format(chat_info.total_messages) }} messages
         · {{ chat_info.member_count }} people
+        {% if chat_info.start_date and chat_info.end_date %}
         · {{ chat_info.start_date.strftime('%b %-d, %Y') }} – {{ chat_info.end_date.strftime('%b %-d, %Y') }}
+        {% endif %}
         · {{ tz_label }}
+        {% if filter_label %} · filter {{ filter_label }}{% endif %}
       </div>
       <p class="blurb">{{ blurb }}</p>
     </header>
@@ -1487,12 +2007,15 @@ PAGE_TMPL = """<!DOCTYPE html>
           <div class="name">{{ m.name }}</div>
           <div class="hero-wrap">
             <div class="hero">
-              {% if value_fmt == 'int' %}{{ "{:,}".format(m[value_key]) }}
-              {% else %}{{ "%.1f"|format(m[value_key]) }}{% endif %}
+              {% set v = m[value_key] %}
+              {% if v is none %}—
+              {% elif value_fmt == 'int' %}{{ "{:,}".format(v) }}
+              {% else %}{{ "%.1f"|format(v) }}{% endif %}
             </div>
             <div class="share">
               {% if share_fmt == 'int' %}{{ "{:,}".format(m[share_key]|int) }} {{ share_suffix }}
               {% elif share_key == 'percentage' %}{{ "%.1f"|format(m.percentage) }} {{ share_suffix }}
+              {% elif m[share_key] is none %}— {{ share_suffix }}
               {% else %}{{ "%.1f"|format(m[share_key]) }} {{ share_suffix }}{% endif %}
             </div>
           </div>
@@ -1503,10 +2026,12 @@ PAGE_TMPL = """<!DOCTYPE html>
           {% for key, fmt, label in cols %}
           <div class="stat">
             <div class="n">
-              {% if fmt == 'int' %}{{ "{:,}".format(m[key]) }}
-              {% elif fmt == 'pct' %}{{ "%.1f"|format(m[key]) }}%
-              {% elif fmt == 'text' %}{{ m[key] }}
-              {% else %}{{ "%.1f"|format(m[key]) }}{% endif %}
+              {% set cv = m[key] %}
+              {% if cv is none %}—
+              {% elif fmt == 'int' %}{{ "{:,}".format(cv) }}
+              {% elif fmt == 'pct' %}{{ "%.1f"|format(cv) }}%
+              {% elif fmt == 'text' %}{{ cv }}
+              {% else %}{{ "%.1f"|format(cv) }}{% endif %}
             </div>
             <div class="l">{{ label }}</div>
           </div>
@@ -1552,15 +2077,15 @@ INDEX_TMPL = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Group chats</title>
+  <title>Chats</title>
   <link rel="stylesheet" href="{{ css_href }}">
 </head>
 <body>
   <div class="wrap">
     <header>
       <div class="kicker">Leaderboard</div>
-      <h1>Group chats</h1>
-      <div class="meta">{{ tz_label }} · tapbacks include Haha 😂, Love, Like, and !!</div>
+      <h1>Chats</h1>
+      <div class="meta">{{ tz_label }}{% if filter_label %} · filter {{ filter_label }}{% endif %} · groups and 1:1 · tapbacks include Haha 😂, Love, Like, and !!{% if export_formats %} · exports: {{ export_formats|join(', ') }}{% endif %}</div>
     </header>
     <nav class="nav">
       <a href="index.html" class="active">All chats</a>
@@ -1572,11 +2097,19 @@ INDEX_TMPL = """<!DOCTYPE html>
     <div class="card">
       <h2>{{ c.name }}</h2>
       <p>{{ "{:,}".format(c.total_messages) }} messages · {{ c.member_count }} people
-         · {{ c.start_date.strftime('%b %Y') }} – {{ c.end_date.strftime('%b %Y') }}</p>
+         {% if c.start_date and c.end_date %}
+         · {{ c.start_date.strftime('%b %Y') }} – {{ c.end_date.strftime('%b %Y') }}
+         {% endif %}</p>
       <div class="links core-links">
         {% for item in core_nav %}
         <a href="{{ c[item.key] }}">{{ item.label }}</a>
         {% endfor %}
+        {% if 'csv' in export_formats %}
+        <a href="{{ c.folder }}/stats.csv">CSV</a>
+        {% endif %}
+        {% if 'json' in export_formats %}
+        <a href="{{ c.folder }}/stats.json">JSON</a>
+        {% endif %}
       </div>
       <details class="index-more">
         <summary>More stats</summary>
@@ -1596,7 +2129,7 @@ INDEX_TMPL = """<!DOCTYPE html>
       </details>
     </div>
     {% endfor %}
-    <footer>Generated {{ generated.strftime('%b %-d, %Y %-I:%M %p %Z') }}</footer>
+    <footer>Generated {{ generated.strftime('%b %-d, %Y %-I:%M %p %Z') }}{% if export_formats %} · bulk exports in exports/{% endif %}</footer>
   </div>
 </body>
 </html>
@@ -1605,46 +2138,28 @@ INDEX_TMPL = """<!DOCTYPE html>
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Build a local HTML leaderboard from your macOS Messages group chats."
+        description="Build a local HTML leaderboard from your macOS Messages chats (groups and 1:1)."
     )
     parser.add_argument("--db", help="Path to chat.db (default: from .env or ~/Library/Messages/chat.db)")
-    parser.add_argument("--gcs", help='Comma-separated group chat names, e.g. "Family,Roommates"')
+    parser.add_argument("--gcs", help='Comma-separated chat names (groups or 1:1), e.g. "Family,Alex"')
     parser.add_argument("--outdir", help="Output folder (default: ./output)")
     parser.add_argument("--keywords", help='Comma-separated words to rank, e.g. "lol,bet,fr" (or set KEYWORDS in .env)')
+    parser.add_argument("--year", type=int, help="Only include messages from this calendar year")
+    parser.add_argument("--since", help="Only include messages on/after this date (YYYY-MM-DD)")
+    parser.add_argument("--until", help="Only include messages on/before this date (YYYY-MM-DD)")
+    parser.add_argument(
+        "--export",
+        help="Export formats: csv, json, csv,json, or none (default: csv,json / EXPORT in .env)",
+    )
     parser.add_argument(
         "--list",
         action="store_true",
         dest="list_chats",
-        help="Print group chat names from the database, then exit",
+        help="Print group and 1:1 chat names from the database, then exit",
     )
     args = parser.parse_args()
     config = Config(args)
     conn = get_connection(config.db_path)
-
-    if args.list_chats:
-        groups = list_group_chats(conn)
-        conn.close()
-        if groups.empty:
-            print("No named group chats found.")
-            return
-        print(f"{'Messages':>10}  Group name")
-        print("-" * 50)
-        for _, row in groups.iterrows():
-            print(f"{int(row['messages']):>10,}  {row['name']}")
-        print("\nCopy names into TARGET_GROUP_CHATS in .env (comma-separated, exact spelling).")
-        return
-
-    if not config.target_gcs:
-        print("No group chats set. Put names in TARGET_GROUP_CHATS in .env, or pass --gcs.", file=sys.stderr)
-        print("Run `python analyze.py --list` to see your group chats.", file=sys.stderr)
-        conn.close()
-        sys.exit(1)
-
-    print("Group chat leaderboard")
-    print("=" * 60)
-    print(f"Timezone: {config.tz_label}")
-    if config.keywords:
-        print("Keywords: " + ", ".join(config.keywords))
 
     mapper = NameMapper(
         config.aliases_file,
@@ -1652,7 +2167,33 @@ def main():
         config.contacts_dump,
         config.your_name,
     )
-    chats = find_chats(conn, config.target_gcs)
+
+    if args.list_chats:
+        groups, dms = build_chat_index(conn, mapper)
+        conn.close()
+        if not groups and not dms:
+            print("No chats found.")
+            return
+        print_chat_list(groups, dms)
+        return
+
+    if not config.target_gcs:
+        print("No chats set. Put names in TARGET_GROUP_CHATS in .env, or pass --gcs.", file=sys.stderr)
+        print("Run `python analyze.py --list` to see groups and 1:1 chats.", file=sys.stderr)
+        conn.close()
+        sys.exit(1)
+
+    print("Chat leaderboard")
+    print("=" * 60)
+    print(f"Timezone: {config.tz_label}")
+    if config.filter_label:
+        print(f"Filter: {config.filter_label}")
+    if config.keywords:
+        print("Keywords: " + ", ".join(config.keywords))
+    if config.export_formats:
+        print("Exports: " + ", ".join(sorted(config.export_formats)))
+
+    chats = find_chats(conn, config.target_gcs, mapper)
     if not chats:
         print("No matching chats found. Run `python analyze.py --list` to see names.", file=sys.stderr)
         conn.close()
@@ -1662,13 +2203,26 @@ def main():
     for name, chat_id in chats.items():
         print(f"\n{name}")
         messages, reactions = load_chat(conn, chat_id, config.tz)
-        print(f"  {len(messages):,} messages, {len(reactions):,} tapbacks")
+        before = len(messages)
+        messages, reactions = apply_date_filter(messages, reactions, config.since, config.until)
+        if config.filter_label:
+            print(f"  {len(messages):,}/{before:,} messages in range, {len(reactions):,} tapbacks")
+        else:
+            print(f"  {len(messages):,} messages, {len(reactions):,} tapbacks")
+        if messages.empty:
+            print("  Skipping — no messages in this date range")
+            continue
         all_data[name] = compute_stats(messages, reactions, mapper, config.keywords)
         print(f"  {all_data[name]['chat_info']['member_count']} people")
 
     conn.close()
-    out = render(all_data, config)
+    if not all_data:
+        print("No chats had messages in the selected range.", file=sys.stderr)
+        sys.exit(1)
+    out, exports = render(all_data, config)
     print(f"\nWrote {out}")
+    if exports:
+        print(f"Exports ({len(exports)} files), including output/exports/")
 
 
 if __name__ == "__main__":

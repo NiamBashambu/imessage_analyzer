@@ -82,6 +82,118 @@ def canonical_first_name(name):
     return NICKNAMES.get(key, key).title()
 
 
+def _last_token(full_name):
+    parts = [p for p in str(full_name).strip().split() if p]
+    if len(parts) < 2:
+        return None
+    last = parts[-1]
+    # Ignore trailing punctuation
+    last = last.strip(".,'\"")
+    return last or None
+
+
+def label_with_last_initial(full_name, first_name):
+    last = _last_token(full_name)
+    if last and last[0].isalpha():
+        return f"{first_name} {last[0].upper()}."
+    return first_name
+
+
+def label_with_last_name(full_name, first_name):
+    last = _last_token(full_name)
+    if last and last[0].isalpha():
+        return f"{first_name} {last.title()}"
+    return first_name
+
+
+def person_identity_key(full_name):
+    """Stable person key: nickname-normalized first name + rest of name."""
+    parts = [p for p in str(full_name).strip().split() if p]
+    if not parts:
+        return ""
+    first = canonical_first_name(parts[0]).lower()
+    rest = " ".join(parts[1:]).lower()
+    return f"{first}|{rest}" if rest else first
+
+
+def build_chat_labeler(mapper, handle_pairs):
+    """
+    Map (handle_id, is_from_me) → leaderboard label.
+
+    Same person across phone/email merges via contact name (nicknames normalized).
+    If two different people share a first name in this chat:
+      1) First L.   (Dylan C.)
+      2) First Last  if the initial still collides
+    """
+    person_full = {}  # person_id -> full name string (best display form)
+    handle_to_person = {}
+
+    def person_id(handle, is_me):
+        if is_me:
+            return "me"
+        full = mapper.resolve(handle, False)
+        if not full:
+            return None
+        return "n:" + person_identity_key(full)
+
+    for handle, is_me in handle_pairs:
+        is_me = bool(is_me)
+        pid = person_id(handle, is_me)
+        if pid is None:
+            continue
+        handle_to_person[(str(handle), is_me)] = pid
+        if pid == "me":
+            person_full[pid] = mapper.your_name
+        else:
+            full = mapper.resolve(handle, False)
+            prev = person_full.get(pid)
+            if prev is None:
+                person_full[pid] = full
+            else:
+                # Prefer a spelling whose first token already matches the canonical first name
+                # e.g. "Michael Evans" over "Mikey Evans"
+                canon = canonical_first_name(full)
+                prev_tok = str(prev).strip().split()[0].lower()
+                new_tok = str(full).strip().split()[0].lower()
+                if prev_tok != canon.lower() and new_tok == canon.lower():
+                    person_full[pid] = full
+
+    firsts = {pid: canonical_first_name(full) for pid, full in person_full.items()}
+    first_counts = defaultdict(int)
+    for first in firsts.values():
+        first_counts[first.lower()] += 1
+
+    labels = {}
+    for pid, full in person_full.items():
+        first = firsts[pid]
+        if first_counts[first.lower()] > 1:
+            labels[pid] = label_with_last_initial(full, first)
+        else:
+            labels[pid] = first
+
+    label_counts = defaultdict(int)
+    for lab in labels.values():
+        label_counts[lab.lower()] += 1
+    for pid, full in person_full.items():
+        lab = labels[pid]
+        if label_counts[lab.lower()] > 1:
+            labels[pid] = label_with_last_name(full, firsts[pid])
+
+    def lookup(handle, is_me):
+        is_me = bool(is_me)
+        pid = handle_to_person.get((str(handle), is_me))
+        if pid is None:
+            pid = person_id(handle, is_me)
+            if pid is None:
+                return None
+            if pid not in labels:
+                full = mapper.your_name if is_me else mapper.resolve(handle, False)
+                return canonical_first_name(full) if full else None
+        return labels.get(pid)
+
+    return lookup
+
+
 class NameMapper:
     def __init__(self, aliases_path, cache_path, contacts_dump_path, your_name="You"):
         self.aliases_path = Path(aliases_path)
