@@ -1,0 +1,32 @@
+# Secrets and local config
+.env
+aliases.json
+
+# Generated site (recreated by analyze.py)
+output/
+
+# Local Contacts dump / name mappings
+data/name_cache.json
+data/contacts_dump.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+venv/
+.venv/
+env/
+ENV/
+
+# Databases
+*.db
+*.db-shm
+*.db-wal
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
