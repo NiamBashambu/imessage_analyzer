@@ -46,7 +46,8 @@ Browser opens [http://127.0.0.1:5050/](http://127.0.0.1:5050/).
 - Tabs: **Group chats** / **One-on-one** (newest activity first, like Messages)
 - Search by name
 - Click a chat to analyze
-- **Options**: year / date range, keywords, CSV/JSON export
+- **Options**: year / date range, keywords
+- **Export**: choose CSV/JSON format; after analyzing, use **Export** on the report to download
 
 Reports open under `/report/...`. Use **Pick chat** in the nav to choose another.
 

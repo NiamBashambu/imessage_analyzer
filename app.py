@@ -66,10 +66,15 @@ HOME_TMPL = r"""<!DOCTYPE html>
     }
     .wrap { max-width: 860px; margin: 0 auto; padding: 40px 22px 80px; }
     header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
       border-bottom: 3px double var(--ink);
       padding-bottom: 18px;
       margin-bottom: 20px;
     }
+    .header-copy { min-width: 0; flex: 1; }
     .kicker {
       font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
       font-size: 0.72rem;
@@ -179,10 +184,15 @@ HOME_TMPL = r"""<!DOCTYPE html>
       white-space: nowrap;
     }
     details.options {
-      margin: 18px 0 8px;
-      border: 1px solid var(--ink);
-      background: var(--card);
-      padding: 10px 14px;
+      position: relative;
+      flex: 0 0 auto;
+      margin: 0;
+    }
+    .header-actions {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      flex: 0 0 auto;
     }
     details.options summary {
       cursor: pointer;
@@ -192,13 +202,32 @@ HOME_TMPL = r"""<!DOCTYPE html>
       letter-spacing: 0.08em;
       text-transform: uppercase;
       list-style: none;
+      border: 1px solid var(--ink);
+      background: var(--card);
+      padding: 8px 12px;
+      user-select: none;
+      white-space: nowrap;
     }
     details.options summary::-webkit-details-marker { display: none; }
+    details.options[open] summary {
+      background: var(--ink);
+      color: var(--card);
+    }
+    .opts-panel {
+      position: absolute;
+      top: calc(100% + 8px);
+      right: 0;
+      z-index: 40;
+      width: min(360px, calc(100vw - 44px));
+      border: 1px solid var(--ink);
+      background: var(--card);
+      padding: 12px 14px;
+      box-shadow: 0 10px 28px rgba(26, 26, 26, 0.12);
+    }
     .opts {
       display: grid;
       grid-template-columns: 1fr 1fr;
       gap: 10px 14px;
-      margin-top: 12px;
       font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
       font-size: 0.82rem;
     }
@@ -211,6 +240,31 @@ HOME_TMPL = r"""<!DOCTYPE html>
       color: var(--ink);
     }
     .opts .span2 { grid-column: 1 / -1; }
+    .export-actions {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin-top: 4px;
+      font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+    }
+    .export-actions .btn {
+      display: block;
+      text-align: center;
+      border: 1px solid var(--ink);
+      background: var(--ink);
+      color: var(--card);
+      padding: 9px 12px;
+      font-size: 0.72rem;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      text-decoration: none;
+      cursor: default;
+    }
+    .export-actions .btn.secondary {
+      background: var(--card);
+      color: var(--ink);
+    }
     .hint {
       margin-top: 10px;
       font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
@@ -227,6 +281,8 @@ HOME_TMPL = r"""<!DOCTYPE html>
     }
     .busy.on { display: block; }
     @media (max-width: 600px) {
+      header { flex-wrap: wrap; }
+      .header-actions { margin-left: auto; }
       .opts { grid-template-columns: 1fr; }
       h1 { font-size: 1.8rem; }
       .row { grid-template-columns: 64px 1fr; }
@@ -236,20 +292,63 @@ HOME_TMPL = r"""<!DOCTYPE html>
 </head>
 <body>
   <div class="wrap">
-    <header>
-      <div class="kicker">Local · read-only</div>
-      <h1>Pick a chat</h1>
-      <div class="meta">{{ your_name }} · {{ tz_label }} · {{ group_count }} groups · {{ dm_count }} one-on-ones · newest first</div>
-    </header>
-
-    {% with messages = get_flashed_messages() %}
-    {% if messages %}
-    {% for m in messages %}<div class="flash">{{ m }}</div>{% endfor %}
-    {% endif %}
-    {% endwith %}
-
     <form id="analyze-form" method="post" action="{{ url_for('analyze') }}">
       <input type="hidden" name="chat_id" id="chat_id" value="">
+
+      <header>
+        <div class="header-copy">
+          <div class="kicker">Local · read-only</div>
+          <h1>Pick a chat</h1>
+          <div class="meta">{{ your_name }} · {{ tz_label }} · {{ group_count }} groups · {{ dm_count }} one-on-ones · newest first</div>
+        </div>
+        <div class="header-actions">
+          <details class="options" id="options-panel">
+            <summary>Options</summary>
+            <div class="opts-panel">
+              <div class="opts">
+                <label class="span2">Year only
+                  <input type="number" name="year" placeholder="e.g. 2025" min="2005" max="2100" value="{{ year or '' }}">
+                </label>
+                <label>Since (YYYY-MM-DD)
+                  <input type="text" name="since" placeholder="2024-01-01" value="{{ since or '' }}">
+                </label>
+                <label>Until (YYYY-MM-DD)
+                  <input type="text" name="until" placeholder="2024-12-31" value="{{ until or '' }}">
+                </label>
+                <label class="span2">Keywords (comma-separated)
+                  <input type="text" name="keywords" value="{{ keywords }}">
+                </label>
+              </div>
+              <p class="hint">Use Year alone, or Since/Until — not both. Leave blank for all-time.</p>
+            </div>
+          </details>
+          <details class="options" id="export-panel">
+            <summary>Export</summary>
+            <div class="opts-panel">
+              <div class="opts">
+                <label class="span2">Format
+                  <select name="export" id="export-format">
+                    <option value="csv,json" {% if export == 'csv,json' %}selected{% endif %}>CSV + JSON</option>
+                    <option value="csv" {% if export == 'csv' %}selected{% endif %}>CSV only</option>
+                    <option value="json" {% if export == 'json' %}selected{% endif %}>JSON only</option>
+                    <option value="none" {% if export == 'none' %}selected{% endif %}>None</option>
+                  </select>
+                </label>
+              </div>
+              <div class="export-actions">
+                <span class="btn">Pick a chat to analyze</span>
+              </div>
+              <p class="hint">Choosing a chat writes the files, then use <strong>Export</strong> on the report to download CSV/JSON.</p>
+            </div>
+          </details>
+        </div>
+      </header>
+
+      {% with messages = get_flashed_messages() %}
+      {% if messages %}
+      {% for m in messages %}<div class="flash">{{ m }}</div>{% endfor %}
+      {% endif %}
+      {% endwith %}
 
       <div class="tabs" role="tablist">
         <button type="button" class="active" data-tab="group" id="tab-group">Group chats</button>
@@ -297,33 +396,6 @@ HOME_TMPL = r"""<!DOCTYPE html>
         <p class="hint">No one-on-one chats found.</p>
         {% endfor %}
       </div>
-
-      <details class="options">
-        <summary>Options</summary>
-        <div class="opts">
-          <label>Year only
-            <input type="number" name="year" placeholder="e.g. 2025" min="2005" max="2100" value="{{ year or '' }}">
-          </label>
-          <label>Export
-            <select name="export">
-              <option value="csv,json" {% if export == 'csv,json' %}selected{% endif %}>CSV + JSON</option>
-              <option value="csv" {% if export == 'csv' %}selected{% endif %}>CSV only</option>
-              <option value="json" {% if export == 'json' %}selected{% endif %}>JSON only</option>
-              <option value="none" {% if export == 'none' %}selected{% endif %}>None</option>
-            </select>
-          </label>
-          <label>Since (YYYY-MM-DD)
-            <input type="text" name="since" placeholder="2024-01-01" value="{{ since or '' }}">
-          </label>
-          <label>Until (YYYY-MM-DD)
-            <input type="text" name="until" placeholder="2024-12-31" value="{{ until or '' }}">
-          </label>
-          <label class="span2">Keywords (comma-separated)
-            <input type="text" name="keywords" value="{{ keywords }}">
-          </label>
-        </div>
-        <p class="hint">Use Year alone, or Since/Until — not both. Leave blank for all-time.</p>
-      </details>
     </form>
   </div>
   <script>
@@ -337,6 +409,16 @@ HOME_TMPL = r"""<!DOCTYPE html>
       var chatId = document.getElementById("chat_id");
       var busy = document.getElementById("busy");
       var active = "group";
+      var optionsPanel = document.getElementById("options-panel");
+      var exportPanel = document.getElementById("export-panel");
+      if (optionsPanel && exportPanel) {
+        optionsPanel.addEventListener("toggle", function () {
+          if (optionsPanel.open) exportPanel.open = false;
+        });
+        exportPanel.addEventListener("toggle", function () {
+          if (exportPanel.open) optionsPanel.open = false;
+        });
+      }
 
       function showTab(kind) {
         active = kind;

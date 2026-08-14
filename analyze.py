@@ -1802,6 +1802,9 @@ def render(all_data, config):
             tz_label=tz_label,
             filter_label=config.filter_label,
             generated=generated,
+            export_formats=sorted(config.export_formats),
+            csv_url="stats.csv",
+            json_url="stats.json",
         )
         for spec in pages.values():
             members = ranked(
@@ -2056,6 +2059,29 @@ header h1 {
 }
 .key-panel li { margin: 4px 0; }
 .key-panel strong { color: var(--ink); }
+.export-links {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+a.export-btn {
+  display: block;
+  text-align: center;
+  border: 1px solid var(--ink);
+  background: var(--ink);
+  color: var(--card);
+  padding: 9px 12px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  text-decoration: none;
+}
+a.export-btn.secondary {
+  background: var(--card);
+  color: var(--ink);
+}
+a.export-btn:hover { opacity: 0.92; }
 
 .hours {
   margin: 8px 0 36px;
@@ -2351,6 +2377,22 @@ PAGE_TMPL = """<!DOCTYPE html>
           </ul>
         </div>
       </details>
+      {% if export_formats %}
+      <details class="menu export">
+        <summary>Export</summary>
+        <div class="menu-panel key-panel">
+          <p>Download this chat’s stats.</p>
+          <div class="export-links">
+            {% if 'csv' in export_formats %}
+            <a class="export-btn" href="{{ csv_url }}" download>Download CSV</a>
+            {% endif %}
+            {% if 'json' in export_formats %}
+            <a class="export-btn secondary" href="{{ json_url }}" download>Download JSON</a>
+            {% endif %}
+          </div>
+        </div>
+      </details>
+      {% endif %}
     </nav>
 
     {% if show_hours or show_weekdays %}
@@ -2510,10 +2552,10 @@ INDEX_TMPL = """<!DOCTYPE html>
         <a href="{{ c[item.key] }}">{{ item.label }}</a>
         {% endfor %}
         {% if 'csv' in export_formats %}
-        <a href="{{ c.csv_url }}">CSV</a>
+        <a href="{{ c.csv_url }}">Download CSV</a>
         {% endif %}
         {% if 'json' in export_formats %}
-        <a href="{{ c.json_url }}">JSON</a>
+        <a href="{{ c.json_url }}">Download JSON</a>
         {% endif %}
       </div>
       <details class="index-more">
