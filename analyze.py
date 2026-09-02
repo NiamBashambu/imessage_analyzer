@@ -72,6 +72,9 @@ EXPORT_FIELDS = [
     "links",
     "emoji_count",
     "reply_median_min",
+    "reply_avg_min",
+    "reply_p90_min",
+    "reply_max_min",
     "reply_count",
     "recent",
     "peak_hour",
@@ -140,14 +143,15 @@ class Config:
         if export_raw is None:
             export_raw = os.getenv("EXPORT", "csv,json")
         self.export_formats = self._parse_export(export_raw)
+        self.compare = bool(getattr(args, "compare", False))
 
     @classmethod
-    def for_app(cls, *, year=None, since=None, until=None, keywords=None, export=None):
+    def for_app(cls, *, year=None, since=None, until=None, keywords=None, export=None, compare=False):
         """Config for the local web app (picker-driven, no TARGET_GROUP_CHATS required)."""
         args = argparse.Namespace(
             db=None, outdir=None, gcs="", keywords=keywords,
             year=year, since=since, until=until, export=export,
-            app_mode=True, public_prefix="/report",
+            app_mode=True, public_prefix="/report", compare=compare,
         )
         return cls(args)
 
@@ -754,6 +758,349 @@ def load_chat(conn, chat_id, tz):
     return real, reactions
 
 
+def _period_label(start, end_inclusive):
+    """Human label for a date range (end is inclusive day)."""
+    if start is None or end_inclusive is None:
+        return "Period"
+    return f"{start.strftime('%b %-d, %Y')} – {end_inclusive.strftime('%b %-d, %Y')}"
+
+
+def resolve_compare_periods(since, until, messages, tz):
+    """
+    Return (cur_since, cur_until, prev_since, prev_until, cur_label, prev_label).
+
+    cur_until / prev_until are exclusive upper bounds like Config date filters.
+    """
+    if messages.empty:
+        return None
+    min_dt = messages["datetime"].min()
+    max_dt = messages["datetime"].max()
+    end_exclusive = max_dt + pd.Timedelta(days=1)
+
+    if since is not None and until is not None:
+        cur_since, cur_until = since, until
+        length = cur_until - cur_since
+        prev_until = cur_since
+        prev_since = cur_since - length
+        cur_end = cur_until - timedelta(seconds=1)
+        prev_end = prev_until - timedelta(seconds=1)
+        return (
+            cur_since, cur_until, prev_since, prev_until,
+            _period_label(cur_since, cur_end),
+            _period_label(prev_since, prev_end),
+        )
+
+    if since is not None:
+        cur_since, cur_until = since, end_exclusive
+        length = cur_until - cur_since
+        prev_until = cur_since
+        prev_since = cur_since - length
+        cur_end = max_dt
+        prev_end = prev_until - timedelta(seconds=1)
+        return (
+            cur_since, cur_until, prev_since, prev_until,
+            _period_label(cur_since, cur_end),
+            _period_label(prev_since, prev_end),
+        )
+
+    if until is not None:
+        cur_since, cur_until = min_dt, until
+        length = cur_until - cur_since
+        prev_until = cur_since
+        prev_since = cur_since - length
+        cur_end = until - timedelta(seconds=1)
+        prev_end = prev_until - timedelta(seconds=1)
+        return (
+            cur_since, cur_until, prev_since, prev_until,
+            _period_label(cur_since, cur_end),
+            _period_label(prev_since, prev_end),
+        )
+
+    mid = min_dt + (max_dt - min_dt) / 2
+    prev_since, prev_until = min_dt, mid
+    cur_since, cur_until = mid, end_exclusive
+    return (
+        cur_since, cur_until, prev_since, prev_until,
+        _period_label(mid, max_dt),
+        _period_label(min_dt, mid - timedelta(seconds=1)),
+    )
+
+
+def format_reply_minutes(m):
+    """Human-readable reply time for leaderboards."""
+    if m is None:
+        return "—"
+    try:
+        m = float(m)
+    except (TypeError, ValueError):
+        return "—"
+    if m < 1:
+        return f"{int(round(m * 60))}s"
+    if m < 60:
+        return f"{m:.0f}m" if m >= 10 else f"{m:.1f}m"
+    hours = m / 60
+    return f"{hours:.1f}h" if hours < 10 else f"{round(hours)}h"
+
+
+def page_key_bullets(page_id, tz_label=None):
+    """Per-page Key panel bullets (HTML allowed for <strong>)."""
+    base = [
+        "<strong>1 / 2 / 3</strong> = gold, silver, bronze.",
+        "Bar length is relative to whoever is #1 on this page, not a share of the whole chat.",
+    ]
+    tapbacks = "Tapbacks are iMessage reactions: Love, Like, Haha, !!, and ??."
+    per100 = "<strong>Per 100 messages</strong> = stat ÷ texts they sent × 100."
+    tz = tz_label or "your timezone"
+    reply_intro = [
+        f"Only counts a reply if someone else texted last and the gap is under {REPLY_MAX_HOURS} hours.",
+        "Times use s = seconds, m = minutes, h = hours. <strong>Lower is faster.</strong>",
+        "<strong>Lower numbers rank higher</strong> on this page.",
+    ]
+    extras = {
+        "messages": [
+            "Big number = total texts they sent in this date range.",
+            "Under the name = their % of all messages in the chat.",
+        ],
+        "received": [
+            "Big number = tapbacks received on their messages.",
+            per100,
+            tapbacks,
+        ],
+        "given": [
+            "Big number = tapbacks they left on other people’s messages.",
+            per100,
+            tapbacks,
+        ],
+        "haha": [
+            "Big number = 😂 / Haha tapbacks on their messages.",
+            per100,
+            tapbacks,
+        ],
+        "hearts": [
+            "Big number = ❤️ tapbacks on their messages.",
+            per100,
+            tapbacks,
+        ],
+        "likes": [
+            "Big number = 👍 tapbacks on their messages.",
+            per100,
+            tapbacks,
+        ],
+        "huh": [
+            "Big number = ❓ tapbacks on their messages.",
+            per100,
+            tapbacks,
+        ],
+        "magnet": [
+            "Big number = tapbacks received per 100 messages they sent.",
+            "High score = fewer texts, more reactions per text.",
+            tapbacks,
+        ],
+        "balance": [
+            "Big number = tapbacks given ÷ tapbacks received.",
+            "Above 1.0 = they react more than they get reacted to.",
+            tapbacks,
+        ],
+        "pace": [
+            "Big number = average texts per day from their first to last message in range.",
+            f"Uses calendar days in their active span ({tz}).",
+        ],
+        "streaks": [
+            "Big number = longest run of consecutive days with at least one text.",
+        ],
+        "presence": [
+            "Big number = distinct days they sent at least one text.",
+            "Under the name = those days as a % of the chat’s lifespan.",
+        ],
+        "peaks": [
+            "Big number = most messages they sent in a single calendar day.",
+        ],
+        "recent": [
+            "Big number = texts in the 30 days before the latest message in this chat.",
+            "Under the name = that count as a % of their all-time messages in range.",
+        ],
+        "rambles": [
+            "Big number = texts sent immediately after their own previous text.",
+            "Under the name = follow-ups as a % of their messages.",
+        ],
+        "bursts": [
+            "Big number = times they sent 3+ messages in a row before anyone else replied.",
+        ],
+        "kickoffs": [
+            f"Big number = times they were first to text after {SILENCE_HOURS}+ hours of silence.",
+        ],
+        "openers": [
+            "Big number = days where they sent the first message of that calendar day.",
+            "Under the name = those days as a % of all days in the chat.",
+        ],
+        "closers": [
+            "Big number = days where they sent the last message of that calendar day.",
+            "Under the name = those days as a % of all days in the chat.",
+        ],
+        "replies": reply_intro + [
+            "Big number = <strong>median reply time</strong> (typical speed).",
+            "Under the name = how many timed replies they had.",
+        ],
+        "response": reply_intro + [
+            "Big number = <strong>typical reply</strong> (median).",
+            "<strong>9/10 were faster</strong> = 90% of their replies came quicker than this; only the slowest 10% took longer.",
+            "<strong>Slowest reply</strong> = their longest single counted reply gap.",
+        ],
+        "nights": [
+            f"Big number = % of their messages sent 10pm–5am ({tz}).",
+            "Under the name = raw count of night messages.",
+        ],
+        "mornings": [
+            f"Big number = % of their messages sent 5am–10am ({tz}).",
+            "Under the name = raw count of morning messages.",
+        ],
+        "weekends": [
+            "Big number = % of their messages sent Saturday or Sunday.",
+            "Under the name = raw count of weekend messages.",
+        ],
+        "when": [
+            f"Chart = message volume for the <strong>whole chat</strong> by hour ({tz}).",
+            "Person rows still rank by total messages; extras show each person’s busiest hour.",
+        ],
+        "week": [
+            "Chart = message volume for the <strong>whole chat</strong> by weekday.",
+            "Person rows still rank by total messages; extras show each person’s busiest day.",
+        ],
+        "links": [
+            "Big number = messages that include a URL.",
+            "Under the name = link messages as a % of their texts.",
+        ],
+        "emoji": [
+            "Big number = total emoji characters sent.",
+            "Under the name = emoji characters per 100 messages.",
+        ],
+        "veterans": [
+            "Big number = days from their first message to the latest message in range.",
+        ],
+        "ghosts": [
+            "Big number = days since their last text in this chat.",
+            "Under the name = how many texts they sent in the last 30 days.",
+        ],
+        "keywords": [
+            "Each word board ranks who said it most.",
+            "Big number = total times the word appeared in their messages.",
+            "Under the name = uses per 100 messages they sent. Whole-word, case-insensitive.",
+        ],
+        "compare": [
+            "<strong>Now</strong> = the period you picked. <strong>Before</strong> = previous window of equal length.",
+            "Green change = more messages/tapbacks, or faster replies.",
+            "Reply change shows faster/slower vs the prior period.",
+        ],
+    }
+    return base + extras.get(page_id, ["See the description above for what the main number measures."])
+
+
+def build_compare_rows(current_members, previous_members):
+    prev_by_name = {m["name"]: m for m in previous_members}
+    rows = []
+    names = {m["name"] for m in current_members} | set(prev_by_name)
+
+    def msg_delta_class(delta):
+        if delta > 0:
+            return "up"
+        if delta < 0:
+            return "down"
+        return "flat"
+
+    def reply_delta(cur, prev):
+        if cur is None or prev is None:
+            return "—", "flat"
+        diff = cur - prev
+        if abs(diff) < 0.05:
+            return "same", "flat"
+        if diff < 0:
+            return f"{format_reply_minutes(abs(diff))} faster", "better"
+        return f"{format_reply_minutes(diff)} slower", "worse"
+
+    def pace_delta(cur, prev):
+        if cur is None or prev is None:
+            return "—", "flat"
+        diff = cur - prev
+        if abs(diff) < 0.05:
+            return "same", "flat"
+        sign = "+" if diff > 0 else ""
+        return f"{sign}{diff:.1f}/day", "up" if diff > 0 else "down"
+
+    for name in names:
+        cur = next((m for m in current_members if m["name"] == name), {})
+        prev = prev_by_name.get(name, {})
+        cm = int(cur.get("message_count") or 0)
+        pm = int(prev.get("message_count") or 0)
+        ct = int(cur.get("tapbacks_got") or 0)
+        pt = int(prev.get("tapbacks_got") or 0)
+        cr = cur.get("reply_median_min")
+        pr = prev.get("reply_median_min")
+        cp = cur.get("avg_per_day")
+        pp = prev.get("avg_per_day")
+        delta = cm - pm
+        delta_pct = (delta / pm * 100.0) if pm else None
+        td = ct - pt
+        reply_delta_text, reply_delta_class = reply_delta(cr, pr)
+        pace_delta_text, pace_delta_class = pace_delta(cp, pp)
+        if delta > 0:
+            headline = f"+{delta:,} messages"
+        elif delta < 0:
+            headline = f"{delta:,} messages"
+        else:
+            headline = "same message count"
+        if delta_pct is not None:
+            headline += f" ({delta_pct:+.0f}%)"
+        rows.append({
+            "name": name,
+            "current_messages": cm,
+            "previous_messages": pm,
+            "delta_messages": delta,
+            "delta_pct": delta_pct,
+            "headline": headline,
+            "headline_class": msg_delta_class(delta),
+            "metrics": [
+                {
+                    "label": "Messages",
+                    "current": f"{cm:,}",
+                    "previous": f"{pm:,}",
+                    "delta": f"{'+' if delta > 0 else ''}{delta:,}" if delta else "same",
+                    "delta_pct": f"({delta_pct:+.0f}%)" if delta_pct is not None else "",
+                    "delta_class": msg_delta_class(delta),
+                },
+                {
+                    "label": "Tapbacks received",
+                    "current": f"{ct:,}",
+                    "previous": f"{pt:,}",
+                    "delta": f"{'+' if td > 0 else ''}{td:,}" if td else "same",
+                    "delta_pct": "",
+                    "delta_class": msg_delta_class(td),
+                },
+                {
+                    "label": "Median reply time",
+                    "current": format_reply_minutes(cr),
+                    "previous": format_reply_minutes(pr),
+                    "delta": reply_delta_text,
+                    "delta_pct": "",
+                    "delta_class": reply_delta_class,
+                },
+                {
+                    "label": "Messages per day",
+                    "current": f"{cp:.1f}/day" if cp is not None else "—",
+                    "previous": f"{pp:.1f}/day" if pp is not None else "—",
+                    "delta": pace_delta_text,
+                    "delta_pct": "",
+                    "delta_class": pace_delta_class,
+                },
+            ],
+        })
+    rows.sort(key=lambda r: (r["current_messages"], r["delta_messages"]), reverse=True)
+    max_cur = max((r["current_messages"] for r in rows), default=1) or 1
+    for i, row in enumerate(rows, 1):
+        row["rank"] = i
+        row["bar_pct"] = row["current_messages"] / max_cur * 100 if max_cur else 0
+    return rows
+
+
 def apply_date_filter(messages, reactions, since, until):
     """Keep rows in [since, until)."""
     if since is None and until is None:
@@ -1044,6 +1391,15 @@ def compute_stats(messages, reactions, mapper, keywords=None):
             "reply_median_min": (
                 float(pd.Series(s["reply_gaps"]).median() / 60.0) if s["reply_gaps"] else None
             ),
+            "reply_avg_min": (
+                float(pd.Series(s["reply_gaps"]).mean() / 60.0) if s["reply_gaps"] else None
+            ),
+            "reply_p90_min": (
+                float(pd.Series(s["reply_gaps"]).quantile(0.9) / 60.0) if s["reply_gaps"] else None
+            ),
+            "reply_max_min": (
+                float(max(s["reply_gaps"]) / 60.0) if s["reply_gaps"] else None
+            ),
         })
 
     max_hour = max(hours.values()) if hours else 1
@@ -1111,6 +1467,7 @@ CORE_PAGES = [
     ("given", "Given", "given", "Tapbacks they put on others"),
     ("pace", "Pace", "pace", "Average messages per day"),
     ("when", "When", "when", "What hour they text"),
+    ("compare", "Compare", "compare", "Current vs previous period"),
 ]
 
 EXTRA_GROUPS = [
@@ -1135,6 +1492,7 @@ EXTRA_GROUPS = [
         ("closers", "Closers", "closers", "Last text of each day"),
         ("kickoffs", "Kickoffs", "kickoffs", f"First text after {SILENCE_HOURS}h+ silence"),
         ("replies", "Replies", "replies", "Fastest median reply time"),
+        ("response", "Response", "response", "Median, average, and slow replies"),
         ("nights", "Nights", "nights", "Share sent 10pm–5am"),
         ("mornings", "Mornings", "mornings", "Share sent 5–10am"),
         ("weekends", "Weekends", "weekends", "Share sent Sat–Sun"),
@@ -1247,9 +1605,9 @@ def analyze_chats(conn, mapper, chat_map, config, quiet=False):
             print(f"\n{name}")
             if len(chat_ids) > 1:
                 print(f"  Merged {len(chat_ids)} threads (phone/email)")
-        messages, reactions = load_chat(conn, chat_ids, config.tz)
-        before = len(messages)
-        messages, reactions = apply_date_filter(messages, reactions, config.since, config.until)
+        all_msgs, all_reacts = load_chat(conn, chat_ids, config.tz)
+        before = len(all_msgs)
+        messages, reactions = apply_date_filter(all_msgs, all_reacts, config.since, config.until)
         if not quiet:
             if config.filter_label:
                 print(f"  {len(messages):,}/{before:,} messages in range, {len(reactions):,} tapbacks")
@@ -1260,6 +1618,19 @@ def analyze_chats(conn, mapper, chat_map, config, quiet=False):
                 print("  Skipping — no messages in this date range")
             continue
         payload = compute_stats(messages, reactions, mapper, config.keywords)
+        if config.compare:
+            windows = resolve_compare_periods(config.since, config.until, all_msgs, config.tz)
+            if windows:
+                cur_since, cur_until, prev_since, prev_until, cur_label, prev_label = windows
+                cur_msgs, cur_reacts = apply_date_filter(all_msgs, all_reacts, cur_since, cur_until)
+                prev_msgs, prev_reacts = apply_date_filter(all_msgs, all_reacts, prev_since, prev_until)
+                cur_members = compute_stats(cur_msgs, cur_reacts, mapper, config.keywords)["members"] if not cur_msgs.empty else []
+                prev_members = compute_stats(prev_msgs, prev_reacts, mapper, config.keywords)["members"] if not prev_msgs.empty else []
+                payload["compare"] = {
+                    "cur_label": cur_label,
+                    "prev_label": prev_label,
+                    "rows": build_compare_rows(cur_members, prev_members),
+                }
         badge, subtitle = kind_subtitle(
             kind, name, payload["chat_info"]["member_count"], config.your_name
         )
@@ -1440,6 +1811,7 @@ def render(all_data, config):
             "json_url": (
                 f"{config.public_prefix}/{folder}/stats.json" if config.app_mode else f"{folder}/stats.json"
             ),
+            "has_compare": bool(payload.get("compare")),
         })
 
     generated = datetime.now(config.tz)
@@ -1740,14 +2112,32 @@ def render(all_data, config):
         },
         "replies": {
             "page": "replies", "file": "replies", "title": "Fastest replies", "kicker": "Speed",
-            "blurb": f"Median minutes to reply after someone else texted (gaps under {REPLY_MAX_HOURS} hours). Lower is faster.",
-            "value_key": "reply_median_min", "value_fmt": "num",
+            "blurb": f"Median reply time after someone else texted (gaps under {REPLY_MAX_HOURS} hours). Lower is faster.",
+            "value_key": "reply_median_min", "value_fmt": "reply",
             "share_key": "reply_count", "share_suffix": "timed replies", "share_fmt": "int",
             "ascending": True,
             "cols": [
-                ("reply_median_min", "num", "Median reply (min)"),
+                ("reply_median_min", "reply", "Typical reply"),
                 ("reply_count", "int", "Timed replies"),
                 ("message_count", "int", "Messages"),
+            ],
+        },
+        "response": {
+            "page": "response", "file": "response", "title": "Response time breakdown", "kicker": "Response",
+            "blurb": (
+                f"How fast each person replies after someone else texts (gaps under {REPLY_MAX_HOURS} hours). "
+                "Typical = median reply. Slow reply cutoff = 9 out of 10 replies were faster than this "
+                "(only the slowest 10% took longer)."
+            ),
+            "value_key": "reply_median_min", "value_fmt": "reply",
+            "share_key": "reply_count", "share_suffix": "timed replies", "share_fmt": "int",
+            "ascending": True,
+            "cols": [
+                ("reply_median_min", "reply", "Typical reply"),
+                ("reply_avg_min", "reply", "Average reply"),
+                ("reply_p90_min", "reply", "9/10 were faster"),
+                ("reply_max_min", "reply", "Slowest reply"),
+                ("reply_count", "int", "Timed replies"),
             ],
         },
         "links": {
@@ -1801,6 +2191,7 @@ def render(all_data, config):
         core_nav = [
             {**item, "href": page_filename(item["file"])}
             for item in core_meta
+            if item["id"] != "compare" or payload.get("compare")
         ]
         extra_groups = [
             {
@@ -1827,8 +2218,11 @@ def render(all_data, config):
             export_formats=sorted(config.export_formats),
             csv_url="stats.csv",
             json_url="stats.json",
+            format_reply=format_reply_minutes,
         )
         for spec in pages.values():
+            if spec["page"] == "compare":
+                continue
             members = ranked(
                 payload["members"],
                 spec["value_key"],
@@ -1858,6 +2252,7 @@ def render(all_data, config):
                     (item["label"] for g in extra_groups for item in g["links"] if item["id"] == spec["page"]),
                     None,
                 ),
+                key_bullets=page_key_bullets(spec["page"], tz_label),
             )
             (chat_dir / filename).write_text(html)
         if config.keywords:
@@ -1881,8 +2276,22 @@ def render(all_data, config):
                 keyword_boards=payload.get("keyword_boards", []),
                 page_is_extra=True,
                 extra_current="Keywords",
+                key_bullets=page_key_bullets("keywords", tz_label),
             )
             (chat_dir / "keywords.html").write_text(html)
+        if payload.get("compare"):
+            compare_t = Template(COMPARE_TMPL)
+            html = compare_t.render(
+                **page_kwargs,
+                page="compare",
+                title="Compare periods",
+                kicker="Compare",
+                blurb=f"How each person changed between {payload['compare']['prev_label']} and {payload['compare']['cur_label']}.",
+                compare=payload["compare"],
+                compare_rows=payload["compare"]["rows"],
+                key_bullets=page_key_bullets("compare", tz_label),
+            )
+            (chat_dir / "compare.html").write_text(html)
 
     group_chats = [c for c in chats if c.get("kind") != "dm"]
     dm_chats = [c for c in chats if c.get("kind") == "dm"]
@@ -1921,6 +2330,28 @@ CSS = """
   --gold: #b0892c;
   --silver: #7d7d7d;
   --bronze: #a15c2d;
+  --up: #1f6b42;
+  --down: #a33d2e;
+  --bar-bg: #ddd6c8;
+  --surface: #faf6ef;
+  --border-strong: #1a1a1a;
+}
+
+[data-theme="dark"] {
+  --ink: #e8e4dc;
+  --muted: #9a958c;
+  --line: #3a3834;
+  --bg: #141310;
+  --card: #1c1a17;
+  --accent: #7aab96;
+  --gold: #d4a84b;
+  --silver: #a8a8a8;
+  --bronze: #c47a45;
+  --up: #8fd4b6;
+  --down: #e8a298;
+  --bar-bg: #2e2c28;
+  --surface: #22201c;
+  --border-strong: #5a5752;
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -2182,7 +2613,7 @@ a.export-btn:hover { opacity: 0.92; }
   margin-top: 2px;
 }
 
-.bar { height: 6px; background: #e8e2d6; margin: 10px 0 0; }
+.bar { height: 6px; background: var(--bar-bg); margin: 10px 0 0; }
 .bar > span { display: block; height: 100%; background: var(--accent); }
 
 .stats {
@@ -2190,6 +2621,9 @@ a.export-btn:hover { opacity: 0.92; }
   grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
   gap: 8px 12px;
   margin-top: 12px;
+  padding: 10px 12px;
+  background: var(--surface);
+  border: 1px solid var(--line);
 }
 .stat {
   font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
@@ -2322,6 +2756,159 @@ footer {
   border-top: 1px solid var(--ink);
 }
 
+.theme-toggle {
+  margin-left: auto;
+  border: 1px solid var(--ink);
+  background: var(--ink);
+  color: var(--card);
+  padding: 5px 11px;
+  font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+  font-size: 0.72rem;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+.theme-toggle:hover {
+  opacity: 0.9;
+}
+.compare-periods {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin: 0 0 18px;
+  font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+  font-size: 0.82rem;
+}
+.compare-period {
+  border: 1px solid var(--border-strong);
+  padding: 12px 14px;
+  background: var(--surface);
+  color: var(--ink);
+  line-height: 1.35;
+}
+.compare-period strong {
+  display: block;
+  font-size: 0.62rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--accent);
+  font-weight: 700;
+  margin-bottom: 6px;
+}
+.compare-row .compare-grid {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 10px 16px;
+  align-items: baseline;
+  margin-top: 10px;
+  padding: 10px 12px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+  font-size: 0.8rem;
+}
+.compare-key {
+  margin: 0 0 14px;
+  padding: 10px 12px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+  font-size: 0.82rem;
+  color: var(--muted);
+  line-height: 1.45;
+}
+.compare-key strong { color: var(--ink); }
+.compare-board { display: flex; flex-direction: column; gap: 18px; }
+.compare-person {
+  border: 1px solid var(--border-strong);
+  background: var(--card);
+  padding: 14px 16px 12px;
+}
+.compare-person-head {
+  display: grid;
+  grid-template-columns: 36px 1fr auto;
+  gap: 10px 12px;
+  align-items: baseline;
+  margin-bottom: 12px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--line);
+}
+.compare-name {
+  font-size: 1.35rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+.compare-headline {
+  font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+  font-size: 0.82rem;
+  font-weight: 700;
+  text-align: right;
+  white-space: nowrap;
+}
+.compare-metrics {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+  font-size: 0.82rem;
+}
+.compare-metrics th,
+.compare-metrics td {
+  padding: 8px 6px;
+  border-bottom: 1px solid var(--line);
+  text-align: right;
+  vertical-align: middle;
+}
+.compare-metrics thead th {
+  font-size: 0.62rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  font-weight: 700;
+  border-bottom: 1px solid var(--border-strong);
+}
+.compare-metrics tbody th[scope="row"] {
+  text-align: left;
+  font-weight: 650;
+  color: var(--ink);
+}
+.compare-metrics td.current {
+  font-weight: 700;
+  color: var(--ink);
+}
+.compare-metrics td.previous {
+  color: var(--muted);
+}
+.compare-metrics td.num {
+  font-variant-numeric: tabular-nums;
+}
+.compare-metrics .pct {
+  font-size: 0.72rem;
+  color: var(--muted);
+  font-weight: 600;
+}
+.compare-metrics tr:last-child th,
+.compare-metrics tr:last-child td {
+  border-bottom: 0;
+}
+.compare-pair {
+  color: var(--ink);
+}
+.compare-pair strong {
+  color: var(--ink);
+  font-weight: 700;
+}
+.delta {
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.delta.up { color: var(--up); }
+.delta.down { color: var(--down); }
+.delta.flat { color: var(--muted); }
+.delta.better { color: var(--up); }
+.delta.worse { color: var(--down); }
+
 @media print {
   body { background: #fff; }
   .nav, .subnav, footer, .blurb { display: none; }
@@ -2330,12 +2917,148 @@ footer {
 }
 """
 
+THEME_HEAD_SCRIPT = """<script>try{if(localStorage.getItem("imessage-theme")==="dark")document.documentElement.setAttribute("data-theme","dark")}catch(e){}</script>"""
+
+THEME_BODY_SCRIPT = """
+    (function () {
+      var key = "imessage-theme";
+      var root = document.documentElement;
+      function apply(theme) {
+        if (theme === "dark") root.setAttribute("data-theme", "dark");
+        else root.removeAttribute("data-theme");
+        try { localStorage.setItem(key, theme); } catch (e) {}
+        document.querySelectorAll(".theme-toggle").forEach(function (btn) {
+          btn.textContent = theme === "dark" ? "Light" : "Dark";
+        });
+      }
+      var saved = null;
+      try { saved = localStorage.getItem(key); } catch (e) {}
+      if (saved === "dark" || saved === "light") apply(saved);
+      document.querySelectorAll(".theme-toggle").forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          apply(root.getAttribute("data-theme") === "dark" ? "light" : "dark");
+        });
+      });
+    })();
+"""
+
+COMPARE_TMPL = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{ chat_name }} · {{ title }}</title>
+  """ + THEME_HEAD_SCRIPT + """
+  <link rel="stylesheet" href="{{ css_href }}">
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div class="kicker">{{ kicker }}</div>
+      <h1>{{ chat_name }}</h1>
+      <div class="page-title">{{ title }}</div>
+      <div class="meta">
+        {% if chat_info.kind_subtitle %}{{ chat_info.kind_subtitle }} · {% endif %}
+        {{ tz_label }}
+        {% if filter_label %} · filter {{ filter_label }}{% endif %}
+      </div>
+      <p class="blurb">{{ blurb }}</p>
+    </header>
+
+    <nav class="nav">
+      <a href="{{ home_href }}">{{ home_label }}</a>
+      {% for c in chats %}
+      <a href="{{ c.messages_url }}" class="{{ 'active' if c.name == chat_name else '' }}">
+        <span class="badge {{ 'dm' if c.kind == 'dm' else 'group' }}">{{ c.kind_badge }}</span>
+        {{ c.name }}
+      </a>
+      {% endfor %}
+    </nav>
+    <nav class="subnav">
+      {% for item in core_nav %}
+      <a href="{{ item.href }}" class="{{ 'active' if page == item.id else '' }}">{{ item.label }}</a>
+      {% endfor %}
+      <details class="menu">
+        <summary>More stats</summary>
+        <div class="menu-panel">
+          {% for group in extra_groups %}
+          <div class="menu-group">
+            <div class="menu-label">{{ group.label }}</div>
+            {% for item in group.links %}
+            <a href="{{ item.href }}">
+              <span>{{ item.label }}</span>
+              <small>{{ item.hint }}</small>
+            </a>
+            {% endfor %}
+          </div>
+          {% endfor %}
+        </div>
+      </details>
+      <details class="menu key">
+        <summary>Key</summary>
+        <div class="menu-panel key-panel">
+          <p><strong>{{ title }}.</strong> {{ blurb }}</p>
+          <ul>
+            {% for item in key_bullets %}
+            <li>{{ item|safe }}</li>
+            {% endfor %}
+          </ul>
+        </div>
+      </details>
+      <button type="button" class="theme-toggle">Dark</button>
+    </nav>
+
+    <div class="compare-periods">
+      <div class="compare-period"><strong>Now</strong>{{ compare.cur_label }}</div>
+      <div class="compare-period"><strong>Before</strong>{{ compare.prev_label }}</div>
+    </div>
+
+    <div class="compare-board">
+      {% for r in compare_rows %}
+      <section class="compare-person">
+        <header class="compare-person-head">
+          <span class="rank {{ 'g' if r.rank==1 else 's' if r.rank==2 else 'b' if r.rank==3 else '' }}">{{ r.rank }}</span>
+          <h3 class="compare-name">{{ r.name }}</h3>
+          <div class="compare-headline delta {{ r.headline_class }}">{{ r.headline }}</div>
+        </header>
+        <table class="compare-metrics">
+          <thead>
+            <tr>
+              <th scope="col"></th>
+              <th scope="col">Now</th>
+              <th scope="col">Before</th>
+              <th scope="col">Change</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for m in r.metrics %}
+            <tr>
+              <th scope="row">{{ m.label }}</th>
+              <td class="num current">{{ m.current }}</td>
+              <td class="num previous">{{ m.previous }}</td>
+              <td class="num delta {{ m.delta_class }}">{{ m.delta }}{% if m.delta_pct %} <span class="pct">{{ m.delta_pct }}</span>{% endif %}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </section>
+      {% endfor %}
+    </div>
+
+    <footer>Generated {{ generated.strftime('%b %-d, %Y %-I:%M %p %Z') }}</footer>
+  </div>
+  <script>""" + THEME_BODY_SCRIPT + """</script>
+</body>
+</html>
+"""
+
 PAGE_TMPL = """<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>{{ chat_name }} · {{ title }}</title>
+  """ + THEME_HEAD_SCRIPT + """
   <link rel="stylesheet" href="{{ css_href }}">
 </head>
 <body>
@@ -2391,11 +3114,9 @@ PAGE_TMPL = """<!DOCTYPE html>
         <div class="menu-panel key-panel">
           <p><strong>{{ title }}.</strong> {{ blurb }}</p>
           <ul>
-            <li><strong>1 / 2 / 3</strong> are gold, silver, bronze.</li>
-            <li>The bar is relative to whoever is #1 on this page, not a % of the whole chat.</li>
-            <li><strong>Per 100 messages</strong> = this stat ÷ texts they sent × 100.</li>
-            <li><strong>Tapbacks</strong> are iMessage reactions: Love, Like, Haha, !!, ??.</li>
-            <li><strong>Received</strong> = reactions on their texts. <strong>Given</strong> = reactions they left.</li>
+            {% for item in key_bullets %}
+            <li>{{ item|safe }}</li>
+            {% endfor %}
           </ul>
         </div>
       </details>
@@ -2415,6 +3136,7 @@ PAGE_TMPL = """<!DOCTYPE html>
         </div>
       </details>
       {% endif %}
+      <button type="button" class="theme-toggle">Dark</button>
     </nav>
 
     {% if show_hours or show_weekdays %}
@@ -2470,6 +3192,7 @@ PAGE_TMPL = """<!DOCTYPE html>
               {% set v = m[value_key] %}
               {% if v is none %}—
               {% elif value_fmt == 'int' %}{{ "{:,}".format(v) }}
+              {% elif value_fmt == 'reply' %}{{ format_reply(v) }}
               {% else %}{{ "%.1f"|format(v) }}{% endif %}
             </div>
             <div class="share">
@@ -2491,6 +3214,7 @@ PAGE_TMPL = """<!DOCTYPE html>
               {% elif fmt == 'int' %}{{ "{:,}".format(cv) }}
               {% elif fmt == 'pct' %}{{ "%.1f"|format(cv) }}%
               {% elif fmt == 'text' %}{{ cv }}
+              {% elif fmt == 'reply' %}{{ format_reply(cv) }}
               {% else %}{{ "%.1f"|format(cv) }}{% endif %}
             </div>
             <div class="l">{{ label }}</div>
@@ -2527,6 +3251,7 @@ PAGE_TMPL = """<!DOCTYPE html>
         }
       });
     })();
+    """ + THEME_BODY_SCRIPT + """
   </script>
 </body>
 </html>
@@ -2538,6 +3263,7 @@ INDEX_TMPL = """<!DOCTYPE html>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Chats</title>
+  """ + THEME_HEAD_SCRIPT + """
   <link rel="stylesheet" href="{{ css_href }}">
 </head>
 <body>
@@ -2556,6 +3282,7 @@ INDEX_TMPL = """<!DOCTYPE html>
         {{ c.name }}
       </a>
       {% endfor %}
+      <button type="button" class="theme-toggle">Dark</button>
     </nav>
 
     {% macro chat_card(c) %}
@@ -2571,7 +3298,9 @@ INDEX_TMPL = """<!DOCTYPE html>
          {% if c.kind_subtitle %} · {{ c.kind_subtitle }}{% endif %}</p>
       <div class="links core-links">
         {% for item in core_nav %}
+        {% if item.id != 'compare' or c.has_compare %}
         <a href="{{ c[item.key] }}">{{ item.label }}</a>
+        {% endif %}
         {% endfor %}
         {% if 'csv' in export_formats %}
         <a href="{{ c.csv_url }}">Download CSV</a>
@@ -2615,6 +3344,7 @@ INDEX_TMPL = """<!DOCTYPE html>
 
     <footer>Generated {{ generated.strftime('%b %-d, %Y %-I:%M %p %Z') }}{% if export_formats %} · bulk exports in exports/{% endif %}</footer>
   </div>
+  <script>""" + THEME_BODY_SCRIPT + """</script>
 </body>
 </html>
 """

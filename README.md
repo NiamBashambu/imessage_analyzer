@@ -27,7 +27,7 @@ TIMEZONE=America/Los_Angeles
 KEYWORDS=lol,lmao,omg,fr,bet
 ```
 
-`TARGET_GROUP_CHATS` is only needed for the CLI batch mode. With the app, you pick chats in the browser.
+`TARGET_GROUP_CHATS` is only needed for CLI batch mode. With the app, you pick chats in the browser.
 
 ### 1. Full Disk Access
 
@@ -43,13 +43,21 @@ python app.py
 
 Browser opens [http://127.0.0.1:5050/](http://127.0.0.1:5050/).
 
-- Tabs: **Group chats** / **One-on-one** (newest activity first, like Messages)
-- Search by name
-- Click a chat to choose a **date range** (presets or slider), then analyze
-- **Options**: keywords
-- **Export**: choose CSV/JSON format; after analyzing, use **Export** on the report to download
+1. Switch **Group chats** / **One-on-one** (newest first, like Messages)
+2. Search by name
+3. Click a chat → choose a **date range** (presets or slider)
+4. Optionally check **Compare to previous period**
+5. Click **Analyze**
 
-Reports open under `/report/...`. Use **Pick chat** in the nav to choose another.
+Top-right controls:
+
+| Button | What it does |
+| --- | --- |
+| **Options** | Keywords for the Keywords page |
+| **Export** | CSV/JSON format (downloads appear on the report after analyze) |
+| **Dark** | Light/dark theme (saved in your browser) |
+
+Reports open under `/report/...`. Use **Pick chat** in the nav to analyze another.
 
 The first run may ask for **Contacts** access — allow it so numbers become names.
 
@@ -57,7 +65,29 @@ Change the port with `PORT=5050` in `.env` if needed.
 
 ---
 
-## What the picker does
+## Date range & compare
+
+When you click a chat, a modal opens (the chat list is not re-queried on every slider move):
+
+| Control | Behavior |
+| --- | --- |
+| **Presets** | All time, Last 7/30/90 days, Last year, This year |
+| **Slider** | Drag start/end within that chat’s full history |
+| **Compare** | Current window vs previous equal-length window |
+
+Compare examples:
+
+- **Last 30 days** → previous 30 days before that
+- **Jan–Mar 2025** → Oct–Dec 2024 (same length)
+- **All time** → first half vs second half of the chat
+
+With compare enabled, you land on the **Compare** report. Main stats pages still use your selected date range.
+
+Chat date bounds are fetched once per chat per session (lightweight query), then cached in the browser.
+
+---
+
+## What the picker filters
 
 | Behavior | Detail |
 | --- | --- |
@@ -67,7 +97,6 @@ Change the port with `PORT=5050` in `.env` if needed.
 | **Short codes** | Skips 4–6 digit blast / OTP-style SMS |
 | **Merge 1:1s** | Same Contacts person (phone + email) → one entry; analysis combines both threads |
 | **Merge groups** | Same display name → one entry (iMessage often creates a second room id for the same named group) |
-| **Date range** | Per chat: presets (7/30/90 days, etc.) + slider; bounds fetched once per chat, analyze runs once |
 
 Unresolved Contacts still show as phone/email until you allow Contacts or add an `aliases.json` mapping.
 
@@ -75,27 +104,32 @@ Unresolved Contacts still show as phone/email until you allow Contacts or add an
 
 ## What you get
 
-One folder per chat under `output/`. Main row: Messages, Received, Given, Pace, When. Everything else is under **More stats**. Open **Key** on any page for how to read the numbers.
+One folder per chat under `output/`. Open **Key** on any page for how to read the numbers.
 
-| Main | What it ranks |
+### Main pages
+
+| Page | What it ranks |
 | --- | --- |
 | **Messages** | Texts sent (best screenshot page) |
 | **Received / Given** | Tapbacks got vs tapbacks given |
 | **Pace** | Messages per day |
 | **When** | Hour of day |
+| **Compare** | Current vs previous period (messages, tapbacks, reply time, pace) |
 
-| More stats | What it ranks |
+### More stats
+
+| Group | Pages |
 | --- | --- |
-| **Haha / Hearts / Likes / Huh** | 😂, ❤️, 👍, ❓ received |
-| **Magnet / Balance** | Tapbacks per message, given ÷ received |
-| **Streaks / Presence / Peaks / Recent / Rambles / Bursts** | Daily run, days active, biggest day, last 30 days, back-to-back, 3+ in a row |
-| **Openers / Closers / Kickoffs / Replies** | First/last of day, restart after silence, fastest median reply |
-| **Nights / Mornings / Weekends / Week** | Late-night, 5–10am, Sat–Sun, weekday |
-| **Links / Emoji** | URLs, emoji volume |
-| **Veterans / Ghosts** | Longest tenure, days since last text |
-| **Keywords** | Who said each word (set `KEYWORDS` or Options) |
+| **Tapbacks** | Haha, Hearts, Likes, Huh, Magnet, Balance |
+| **Consistency** | Streaks, Presence, Peaks, Recent, Rambles, Bursts |
+| **Timing** | Openers, Closers, Kickoffs, Replies, **Response**, Nights, Mornings, Weekends, Week |
+| **Content** | Links, Emoji |
+| **Tenure** | Veterans, Ghosts |
+| **Words** | Keywords (from `KEYWORDS` or Options) |
 
-Names come from macOS Contacts. Nicknames like Mike / Mikey / Michael are merged. If two different people in the same chat share a first name, labels become **First L.** (or **First Last** if the initial still clashes). Reports show a **Group** or **1:1** badge.
+**Response** (under Timing) breaks down reply speed: median, average, 90th percentile, and slowest reply (gaps under 12 hours after someone else texts).
+
+Names come from macOS Contacts. Nicknames like Mike / Mikey / Michael are merged. If two people in the same chat share a first name, labels become **First L.** (or **First Last** if needed). Reports show a **Group** or **1:1** badge.
 
 ---
 
@@ -108,7 +142,7 @@ Names come from macOS Contacts. Nicknames like Mike / Mikey / Michael are merged
 | `KEYWORDS` | No | Words to rank (comma-separated) |
 | `EXPORT` | No | `csv,json` (default), `csv`, `json`, or `none` |
 | `TARGET_GROUP_CHATS` | CLI only | Names from `python analyze.py --list` |
-| `YEAR` / `SINCE` / `UNTIL` | No | Date filters for CLI (app uses Options) |
+| `YEAR` / `SINCE` / `UNTIL` | CLI only | Date filters for `analyze.py` (app uses the per-chat modal) |
 | `PORT` | No | App port (default `5050`) |
 | `DB_PATH` | No | Default `~/Library/Messages/chat.db` |
 | `ALIASES_FILE` | No | Path to phone/email → name overrides |
@@ -152,18 +186,18 @@ python analyze.py
 open output/index.html
 ```
 
-### Date filters
+### Date filters (CLI only)
 
 ```bash
 python analyze.py --year 2025
 python analyze.py --since 2024-06-01 --until 2025-12-31
 ```
 
-Or set `YEAR` / `SINCE` / `UNTIL` in `.env`. In the app, use **Options**.
+Or set `YEAR` / `SINCE` / `UNTIL` in `.env`. The web app uses the per-chat date modal instead.
 
 ### Exports (CSV / JSON)
 
-By default each run writes:
+Default output:
 
 | Path | Contents |
 | --- | --- |
@@ -172,6 +206,8 @@ By default each run writes:
 | `output/exports/members.csv` | All chats combined |
 | `output/exports/chats.csv` | Chat-level summary |
 | `output/exports/all.json` | Combined JSON |
+
+In the app: set format under **Export** before analyzing, then use **Export → Download CSV/JSON** on the report.
 
 ```bash
 python analyze.py --export csv
@@ -199,10 +235,12 @@ python analyze.py --export csv,json
 | App won’t open chats | Same FDA rule — Cursor and Terminal are separate apps. |
 | `No chats set` (CLI) | Use `app.py`, or set `TARGET_GROUP_CHATS` / `--gcs`. |
 | 1:1 shows a phone number | Allow Contacts, or map it in `aliases.json`. |
-| Duplicate group names | Same-named rooms are merged automatically; restart `app.py` after pulling updates. |
-| Spam / random people in 1:1 | Filtered Unknown Senders, short codes, and unnamed groups are excluded; restart the app. |
-| Date filter empty | Widen the range or clear Options / env filters. |
-| Stale picker list | Restart `python app.py` (no auto-reload unless you restart). |
+| Duplicate group names | Same-named rooms are merged automatically. |
+| Spam / random people in 1:1 | Filtered Unknown Senders, short codes, and unnamed groups are excluded. |
+| No messages in range | Widen the date slider or pick **All time**. |
+| Compare page missing | Check **Compare to previous period** in the date modal before analyzing. |
+| Dark mode resets | Theme is per-browser via `localStorage`; use the **Dark** button on picker or reports. |
+| Stale picker / new features | Restart `python app.py` and re-analyze (reports are regenerated each run). |
 
 ---
 
@@ -215,7 +253,7 @@ Never commit `.env`, `aliases.json`, `data/*cache*`, `output/`, or any `chat.db`
 ## Layout
 
 ```
-app.py                  local web app (pick Group vs 1:1)
+app.py                  local web app (pick Group vs 1:1, date range, compare)
 analyze.py              CLI + shared analyze/render pipeline
 src/name_mapper.py      Contacts + nickname merging
 .env.example            copy to .env

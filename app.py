@@ -49,6 +49,7 @@ HOME_TMPL = r"""<!DOCTYPE html>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>iMessage leaderboard</title>
+  <script>try{if(localStorage.getItem("imessage-theme")==="dark")document.documentElement.setAttribute("data-theme","dark")}catch(e){}</script>
   <style>
     :root {
       --ink: #1a1a1a;
@@ -57,6 +58,20 @@ HOME_TMPL = r"""<!DOCTYPE html>
       --bg: #f3efe7;
       --card: #fffcf7;
       --accent: #2c4a3e;
+      --surface: #faf6ef;
+      --border-strong: #1a1a1a;
+      --bar-bg: #ddd6c8;
+    }
+    [data-theme="dark"] {
+      --ink: #e8e4dc;
+      --muted: #9a958c;
+      --line: #3a3834;
+      --bg: #141310;
+      --card: #1c1a17;
+      --accent: #7aab96;
+      --surface: #22201c;
+      --border-strong: #5a5752;
+      --bar-bg: #2e2c28;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -99,8 +114,8 @@ HOME_TMPL = r"""<!DOCTYPE html>
     }
     .flash {
       font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
-      background: #f7e4e0;
-      border: 1px solid var(--ink);
+      background: var(--surface);
+      border: 1px solid var(--border-strong);
       padding: 10px 12px;
       margin-bottom: 16px;
       font-size: 0.85rem;
@@ -388,7 +403,7 @@ HOME_TMPL = r"""<!DOCTYPE html>
       top: 50%;
       height: 4px;
       margin-top: -2px;
-      background: var(--line);
+      background: var(--bar-bg);
       border-radius: 2px;
     }
     .range-summary {
@@ -421,6 +436,33 @@ HOME_TMPL = r"""<!DOCTYPE html>
       opacity: 0.45;
       cursor: not-allowed;
     }
+    .compare-opt {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      margin: 12px 0 4px;
+      padding: 10px 12px;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+      font-size: 0.82rem;
+      color: var(--ink);
+      cursor: pointer;
+    }
+    .compare-opt input { margin-top: 3px; accent-color: var(--accent); }
+    .theme-toggle {
+      border: 1px solid var(--ink);
+      background: var(--ink);
+      color: var(--card);
+      padding: 8px 12px;
+      font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+      font-size: 0.72rem;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      cursor: pointer;
+    }
+    .theme-toggle:hover { opacity: 0.9; }
     @media (max-width: 600px) {
       header { flex-wrap: wrap; }
       .header-actions { margin-left: auto; }
@@ -437,6 +479,7 @@ HOME_TMPL = r"""<!DOCTYPE html>
       <input type="hidden" name="chat_id" id="chat_id" value="">
       <input type="hidden" name="since" id="since" value="">
       <input type="hidden" name="until" id="until" value="">
+      <input type="hidden" name="compare" id="compare-input" value="0">
 
       <header>
         <div class="header-copy">
@@ -475,6 +518,7 @@ HOME_TMPL = r"""<!DOCTYPE html>
               <p class="hint">Choosing a chat writes the files, then use <strong>Export</strong> on the report to download CSV/JSON.</p>
             </div>
           </details>
+          <button type="button" class="theme-toggle">Dark</button>
         </div>
       </header>
 
@@ -555,6 +599,10 @@ HOME_TMPL = r"""<!DOCTYPE html>
           </div>
           <div class="range-summary" id="range-summary">All messages in this chat.</div>
         </div>
+        <label class="compare-opt">
+          <input type="checkbox" id="compare-check">
+          Compare to previous period of equal length
+        </label>
         <div class="modal-actions">
           <button type="button" id="modal-cancel">Cancel</button>
           <button type="button" class="primary" id="modal-analyze" disabled>Analyze</button>
@@ -588,6 +636,8 @@ HOME_TMPL = r"""<!DOCTYPE html>
       var rangeSummary = document.getElementById("range-summary");
       var modalCancel = document.getElementById("modal-cancel");
       var modalAnalyze = document.getElementById("modal-analyze");
+      var compareCheck = document.getElementById("compare-check");
+      var compareInput = document.getElementById("compare-input");
       var rangeCache = {};
       var currentRange = null;
       var activePreset = "all";
@@ -670,11 +720,13 @@ HOME_TMPL = r"""<!DOCTYPE html>
           rangeSummary.textContent = "All " + currentRange.messages.toLocaleString() + " messages in this chat.";
           sinceInput.value = "";
           untilInput.value = "";
+          if (compareCheck && !compareCheck.dataset.touched) compareCheck.checked = true;
         } else {
           var spanDays = endIdx - startIdx + 1;
           rangeSummary.textContent = spanDays.toLocaleString() + " day" + (spanDays === 1 ? "" : "s") + " selected.";
           sinceInput.value = formatYmd(startDate);
           untilInput.value = formatYmd(endDate);
+          if (compareCheck && !compareCheck.dataset.touched) compareCheck.checked = true;
         }
       }
 
@@ -757,6 +809,11 @@ HOME_TMPL = r"""<!DOCTYPE html>
         if (!btn) return;
         applyPreset(btn.getAttribute("data-preset"));
       });
+      if (compareCheck) {
+        compareCheck.addEventListener("change", function () {
+          compareCheck.dataset.touched = "1";
+        });
+      }
       rangeStart.addEventListener("input", function () {
         setPresetActive("");
         if (+rangeStart.value > +rangeEnd.value) rangeEnd.value = rangeStart.value;
@@ -776,6 +833,9 @@ HOME_TMPL = r"""<!DOCTYPE html>
       });
       modalAnalyze.addEventListener("click", function () {
         if (!chatId.value) return;
+        if (compareInput && compareCheck) {
+          compareInput.value = compareCheck.checked ? "1" : "0";
+        }
         closeModal();
         busy.classList.add("on");
         form.submit();
@@ -784,6 +844,27 @@ HOME_TMPL = r"""<!DOCTYPE html>
       document.querySelectorAll(".row").forEach(function (row) {
         row.addEventListener("click", function () { openModal(row); });
       });
+
+      (function () {
+        var key = "imessage-theme";
+        var root = document.documentElement;
+        function apply(theme) {
+          if (theme === "dark") root.setAttribute("data-theme", "dark");
+          else root.removeAttribute("data-theme");
+          try { localStorage.setItem(key, theme); } catch (e) {}
+          document.querySelectorAll(".theme-toggle").forEach(function (btn) {
+            btn.textContent = theme === "dark" ? "Light" : "Dark";
+          });
+        }
+        var saved = null;
+        try { saved = localStorage.getItem(key); } catch (e) {}
+        if (saved === "dark" || saved === "light") apply(saved);
+        document.querySelectorAll(".theme-toggle").forEach(function (btn) {
+          btn.addEventListener("click", function () {
+            apply(root.getAttribute("data-theme") === "dark" ? "light" : "dark");
+          });
+        });
+      })();
     })();
   </script>
 </body>
@@ -880,6 +961,7 @@ def analyze():
     until = request.form.get("until") or None
     keywords = request.form.get("keywords")
     export = request.form.get("export") or "csv,json"
+    compare = request.form.get("compare") == "1"
     if since == "":
         since = None
     if until == "":
@@ -891,6 +973,7 @@ def analyze():
             until=until,
             keywords=keywords if keywords is not None else None,
             export=export,
+            compare=compare,
         )
     except ValueError as e:
         flash(str(e))
@@ -923,6 +1006,9 @@ def analyze():
         conn.close()
 
     folder = slug(next(iter(all_data.keys())))
+    chat_payload = next(iter(all_data.values()))
+    if cfg.compare and chat_payload.get("compare"):
+        return redirect(f"/report/{folder}/compare.html")
     return redirect(f"/report/{folder}/index.html")
 
 
