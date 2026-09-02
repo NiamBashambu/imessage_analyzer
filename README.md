@@ -45,8 +45,8 @@ Browser opens [http://127.0.0.1:5050/](http://127.0.0.1:5050/).
 
 - Tabs: **Group chats** / **One-on-one** (newest activity first, like Messages)
 - Search by name
-- Click a chat to analyze
-- **Options**: year / date range, keywords
+- Click a chat to choose a **date range** (presets or slider), then analyze
+- **Options**: keywords
 - **Export**: choose CSV/JSON format; after analyzing, use **Export** on the report to download
 
 Reports open under `/report/...`. Use **Pick chat** in the nav to choose another.
@@ -67,6 +67,7 @@ Change the port with `PORT=5050` in `.env` if needed.
 | **Short codes** | Skips 4–6 digit blast / OTP-style SMS |
 | **Merge 1:1s** | Same Contacts person (phone + email) → one entry; analysis combines both threads |
 | **Merge groups** | Same display name → one entry (iMessage often creates a second room id for the same named group) |
+| **Date range** | Per chat: presets (7/30/90 days, etc.) + slider; bounds fetched once per chat, analyze runs once |
 
 Unresolved Contacts still show as phone/email until you allow Contacts or add an `aliases.json` mapping.
 

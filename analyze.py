@@ -582,6 +582,28 @@ def find_chat_by_id(conn, mapper, chat_id, tz=None):
     return None
 
 
+def get_chat_date_range(conn, chat_ids, tz):
+    """Earliest and latest message dates for one or more merged chat ids."""
+    if isinstance(chat_ids, (list, tuple, set)):
+        ids = [int(x) for x in chat_ids]
+    else:
+        ids = [int(chat_ids)]
+    if not ids:
+        return None, None
+    id_list = ",".join(str(i) for i in ids)
+    row = conn.execute(
+        f"""
+        SELECT MIN(m.date), MAX(m.date)
+        FROM message m
+        JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
+        WHERE cmj.chat_id IN ({id_list})
+        """
+    ).fetchone()
+    if not row or row[0] is None or row[1] is None:
+        return None, None
+    return convert_timestamp(row[0], tz), convert_timestamp(row[1], tz)
+
+
 def kind_subtitle(kind, chat_name, member_count, your_name):
     if kind == "dm":
         return "1:1", f"1:1 · {your_name} & {chat_name}"

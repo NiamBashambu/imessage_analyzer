@@ -17,6 +17,7 @@ from analyze import (  # noqa: E402
     analyze_chats,
     build_chat_index,
     find_chat_by_id,
+    get_chat_date_range,
     get_connection,
     slug,
 )
@@ -280,6 +281,146 @@ HOME_TMPL = r"""<!DOCTYPE html>
       font-weight: 650;
     }
     .busy.on { display: block; }
+    .modal-backdrop {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(26, 26, 26, 0.45);
+      z-index: 100;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .modal-backdrop.open { display: flex; }
+    .modal {
+      width: min(480px, 100%);
+      background: var(--card);
+      border: 1px solid var(--ink);
+      padding: 22px 22px 18px;
+      box-shadow: 0 16px 40px rgba(26, 26, 26, 0.18);
+    }
+    .modal h2 {
+      font-size: 1.55rem;
+      letter-spacing: -0.02em;
+      margin-bottom: 4px;
+    }
+    .modal .modal-meta {
+      font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+      font-size: 0.78rem;
+      color: var(--muted);
+      margin-bottom: 16px;
+    }
+    .presets {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-bottom: 16px;
+      font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+    }
+    .presets button {
+      border: 1px solid var(--ink);
+      background: var(--card);
+      color: var(--ink);
+      padding: 6px 10px;
+      font-size: 0.68rem;
+      font-weight: 700;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      cursor: pointer;
+    }
+    .presets button.active {
+      background: var(--ink);
+      color: var(--card);
+    }
+    .range-block {
+      margin-bottom: 18px;
+      font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+    }
+    .range-labels {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.82rem;
+      font-weight: 650;
+      margin-bottom: 10px;
+    }
+    .range-labels span:last-child { color: var(--muted); font-weight: 500; }
+    .range-track {
+      position: relative;
+      height: 36px;
+      margin: 0 2px;
+    }
+    .range-track input[type="range"] {
+      position: absolute;
+      left: 0;
+      right: 0;
+      width: 100%;
+      margin: 0;
+      pointer-events: none;
+      -webkit-appearance: none;
+      appearance: none;
+      background: transparent;
+      height: 36px;
+    }
+    .range-track input[type="range"]::-webkit-slider-thumb {
+      pointer-events: auto;
+      -webkit-appearance: none;
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      background: var(--ink);
+      border: 2px solid var(--card);
+      cursor: pointer;
+    }
+    .range-track input[type="range"]::-moz-range-thumb {
+      pointer-events: auto;
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      background: var(--ink);
+      border: 2px solid var(--card);
+      cursor: pointer;
+    }
+    .range-track::before {
+      content: "";
+      position: absolute;
+      left: 0;
+      right: 0;
+      top: 50%;
+      height: 4px;
+      margin-top: -2px;
+      background: var(--line);
+      border-radius: 2px;
+    }
+    .range-summary {
+      margin-top: 8px;
+      font-size: 0.78rem;
+      color: var(--muted);
+    }
+    .modal-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+      font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+    }
+    .modal-actions button {
+      border: 1px solid var(--ink);
+      background: var(--card);
+      color: var(--ink);
+      padding: 9px 14px;
+      font-size: 0.72rem;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      cursor: pointer;
+    }
+    .modal-actions button.primary {
+      background: var(--ink);
+      color: var(--card);
+    }
+    .modal-actions button:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
     @media (max-width: 600px) {
       header { flex-wrap: wrap; }
       .header-actions { margin-left: auto; }
@@ -294,6 +435,8 @@ HOME_TMPL = r"""<!DOCTYPE html>
   <div class="wrap">
     <form id="analyze-form" method="post" action="{{ url_for('analyze') }}">
       <input type="hidden" name="chat_id" id="chat_id" value="">
+      <input type="hidden" name="since" id="since" value="">
+      <input type="hidden" name="until" id="until" value="">
 
       <header>
         <div class="header-copy">
@@ -306,20 +449,11 @@ HOME_TMPL = r"""<!DOCTYPE html>
             <summary>Options</summary>
             <div class="opts-panel">
               <div class="opts">
-                <label class="span2">Year only
-                  <input type="number" name="year" placeholder="e.g. 2025" min="2005" max="2100" value="{{ year or '' }}">
-                </label>
-                <label>Since (YYYY-MM-DD)
-                  <input type="text" name="since" placeholder="2024-01-01" value="{{ since or '' }}">
-                </label>
-                <label>Until (YYYY-MM-DD)
-                  <input type="text" name="until" placeholder="2024-12-31" value="{{ until or '' }}">
-                </label>
                 <label class="span2">Keywords (comma-separated)
                   <input type="text" name="keywords" value="{{ keywords }}">
                 </label>
               </div>
-              <p class="hint">Use Year alone, or Since/Until — not both. Leave blank for all-time.</p>
+              <p class="hint">Date range is set per chat when you pick one.</p>
             </div>
           </details>
           <details class="options" id="export-panel">
@@ -397,6 +531,36 @@ HOME_TMPL = r"""<!DOCTYPE html>
         {% endfor %}
       </div>
     </form>
+
+    <div class="modal-backdrop" id="date-modal">
+      <div class="modal" role="dialog" aria-labelledby="modal-title">
+        <h2 id="modal-title">Date range</h2>
+        <div class="modal-meta" id="modal-meta">Loading…</div>
+        <div class="presets" id="presets">
+          <button type="button" data-preset="all" class="active">All time</button>
+          <button type="button" data-preset="7">Last 7 days</button>
+          <button type="button" data-preset="30">Last 30 days</button>
+          <button type="button" data-preset="90">Last 90 days</button>
+          <button type="button" data-preset="365">Last year</button>
+          <button type="button" data-preset="ytd">This year</button>
+        </div>
+        <div class="range-block">
+          <div class="range-labels">
+            <span id="range-start-label">—</span>
+            <span id="range-end-label">—</span>
+          </div>
+          <div class="range-track">
+            <input type="range" id="range-start" min="0" max="0" value="0">
+            <input type="range" id="range-end" min="0" max="0" value="0">
+          </div>
+          <div class="range-summary" id="range-summary">All messages in this chat.</div>
+        </div>
+        <div class="modal-actions">
+          <button type="button" id="modal-cancel">Cancel</button>
+          <button type="button" class="primary" id="modal-analyze" disabled>Analyze</button>
+        </div>
+      </div>
+    </div>
   </div>
   <script>
     (function () {
@@ -407,10 +571,27 @@ HOME_TMPL = r"""<!DOCTYPE html>
       var q = document.getElementById("q");
       var form = document.getElementById("analyze-form");
       var chatId = document.getElementById("chat_id");
+      var sinceInput = document.getElementById("since");
+      var untilInput = document.getElementById("until");
       var busy = document.getElementById("busy");
       var active = "group";
       var optionsPanel = document.getElementById("options-panel");
       var exportPanel = document.getElementById("export-panel");
+      var modal = document.getElementById("date-modal");
+      var modalTitle = document.getElementById("modal-title");
+      var modalMeta = document.getElementById("modal-meta");
+      var presets = document.getElementById("presets");
+      var rangeStart = document.getElementById("range-start");
+      var rangeEnd = document.getElementById("range-end");
+      var rangeStartLabel = document.getElementById("range-start-label");
+      var rangeEndLabel = document.getElementById("range-end-label");
+      var rangeSummary = document.getElementById("range-summary");
+      var modalCancel = document.getElementById("modal-cancel");
+      var modalAnalyze = document.getElementById("modal-analyze");
+      var rangeCache = {};
+      var currentRange = null;
+      var activePreset = "all";
+
       if (optionsPanel && exportPanel) {
         optionsPanel.addEventListener("toggle", function () {
           if (optionsPanel.open) exportPanel.open = false;
@@ -441,12 +622,167 @@ HOME_TMPL = r"""<!DOCTYPE html>
       }
       q.addEventListener("input", filterRows);
 
-      document.querySelectorAll(".row").forEach(function (row) {
-        row.addEventListener("click", function () {
-          chatId.value = row.getAttribute("data-id");
-          busy.classList.add("on");
-          form.submit();
+      function parseYmd(s) {
+        var p = s.split("-");
+        return new Date(+p[0], +p[1] - 1, +p[2]);
+      }
+      function formatYmd(d) {
+        return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
+      }
+      function formatPretty(d) {
+        return d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+      }
+      function addDays(d, n) {
+        var x = new Date(d.getTime());
+        x.setDate(x.getDate() + n);
+        return x;
+      }
+      function daysBetween(a, b) {
+        var ms = Date.UTC(b.getFullYear(), b.getMonth(), b.getDate()) - Date.UTC(a.getFullYear(), a.getMonth(), a.getDate());
+        return Math.round(ms / 86400000);
+      }
+      function dayToDate(minDate, offset) {
+        return addDays(minDate, offset);
+      }
+
+      function setPresetActive(name) {
+        activePreset = name;
+        presets.querySelectorAll("button").forEach(function (btn) {
+          btn.classList.toggle("active", btn.getAttribute("data-preset") === name);
         });
+      }
+
+      function updateRangeUI() {
+        if (!currentRange) return;
+        var minDate = parseYmd(currentRange.min_date);
+        var maxDate = parseYmd(currentRange.max_date);
+        var totalDays = daysBetween(minDate, maxDate);
+        var startIdx = Math.min(+rangeStart.value, +rangeEnd.value);
+        var endIdx = Math.max(+rangeStart.value, +rangeEnd.value);
+        rangeStart.value = startIdx;
+        rangeEnd.value = endIdx;
+        var startDate = dayToDate(minDate, startIdx);
+        var endDate = dayToDate(minDate, endIdx);
+        rangeStartLabel.textContent = formatPretty(startDate);
+        rangeEndLabel.textContent = formatPretty(endDate);
+        var allTime = startIdx === 0 && endIdx === totalDays;
+        if (allTime) {
+          rangeSummary.textContent = "All " + currentRange.messages.toLocaleString() + " messages in this chat.";
+          sinceInput.value = "";
+          untilInput.value = "";
+        } else {
+          var spanDays = endIdx - startIdx + 1;
+          rangeSummary.textContent = spanDays.toLocaleString() + " day" + (spanDays === 1 ? "" : "s") + " selected.";
+          sinceInput.value = formatYmd(startDate);
+          untilInput.value = formatYmd(endDate);
+        }
+      }
+
+      function applyPreset(name) {
+        if (!currentRange) return;
+        setPresetActive(name);
+        var minDate = parseYmd(currentRange.min_date);
+        var maxDate = parseYmd(currentRange.max_date);
+        var totalDays = daysBetween(minDate, maxDate);
+        var startIdx = 0;
+        var endIdx = totalDays;
+        if (name === "all") {
+          startIdx = 0;
+          endIdx = totalDays;
+        } else if (name === "ytd") {
+          var ytdStart = new Date(maxDate.getFullYear(), 0, 1);
+          startIdx = Math.max(0, daysBetween(minDate, ytdStart));
+          endIdx = totalDays;
+        } else {
+          var days = parseInt(name, 10);
+          startIdx = Math.max(0, totalDays - days + 1);
+          endIdx = totalDays;
+        }
+        rangeStart.value = startIdx;
+        rangeEnd.value = endIdx;
+        updateRangeUI();
+      }
+
+      function openModal(row) {
+        var id = row.getAttribute("data-id");
+        var label = row.querySelector(".name").textContent;
+        chatId.value = id;
+        modalTitle.textContent = label;
+        modalMeta.textContent = "Choose a date range";
+        modalAnalyze.disabled = true;
+        rangeStart.disabled = true;
+        rangeEnd.disabled = true;
+        modal.classList.add("open");
+
+        function ready(data) {
+          currentRange = data;
+          rangeCache[id] = data;
+          var minDate = parseYmd(data.min_date);
+          var maxDate = parseYmd(data.max_date);
+          var totalDays = daysBetween(minDate, maxDate);
+          modalMeta.textContent = (data.kind === "dm" ? "1:1" : "Group") + " · " + data.messages.toLocaleString() + " messages · " + formatPretty(minDate) + " – " + formatPretty(maxDate);
+          rangeStart.min = 0;
+          rangeEnd.min = 0;
+          rangeStart.max = totalDays;
+          rangeEnd.max = totalDays;
+          rangeStart.disabled = false;
+          rangeEnd.disabled = false;
+          modalAnalyze.disabled = false;
+          applyPreset("all");
+        }
+
+        if (rangeCache[id]) {
+          ready(rangeCache[id]);
+          return;
+        }
+
+        fetch("/api/chats/" + encodeURIComponent(id) + "/range")
+          .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
+          .then(function (res) {
+            if (!res.ok) throw new Error(res.body.error || "Could not load date range");
+            ready(res.body);
+          })
+          .catch(function (err) {
+            modalMeta.textContent = err.message || "Could not load date range.";
+          });
+      }
+
+      function closeModal() {
+        modal.classList.remove("open");
+        currentRange = null;
+      }
+
+      presets.addEventListener("click", function (e) {
+        var btn = e.target.closest("button[data-preset]");
+        if (!btn) return;
+        applyPreset(btn.getAttribute("data-preset"));
+      });
+      rangeStart.addEventListener("input", function () {
+        setPresetActive("");
+        if (+rangeStart.value > +rangeEnd.value) rangeEnd.value = rangeStart.value;
+        updateRangeUI();
+      });
+      rangeEnd.addEventListener("input", function () {
+        setPresetActive("");
+        if (+rangeEnd.value < +rangeStart.value) rangeStart.value = rangeEnd.value;
+        updateRangeUI();
+      });
+      modalCancel.addEventListener("click", closeModal);
+      modal.addEventListener("click", function (e) {
+        if (e.target === modal) closeModal();
+      });
+      document.addEventListener("keydown", function (e) {
+        if (e.key === "Escape" && modal.classList.contains("open")) closeModal();
+      });
+      modalAnalyze.addEventListener("click", function () {
+        if (!chatId.value) return;
+        closeModal();
+        busy.classList.add("on");
+        form.submit();
+      });
+
+      document.querySelectorAll(".row").forEach(function (row) {
+        row.addEventListener("click", function () { openModal(row); });
       });
     })();
   </script>
@@ -475,9 +811,6 @@ def home():
         tz_label=cfg.tz_label,
         keywords=kw,
         export=export,
-        year=os.getenv("YEAR", ""),
-        since=os.getenv("SINCE", ""),
-        until=os.getenv("UNTIL", ""),
     )
 
 
@@ -509,6 +842,32 @@ def api_chats():
     return jsonify({"groups": pack(groups), "dms": pack(dms)})
 
 
+@app.get("/api/chats/<int:chat_id>/range")
+def api_chat_range(chat_id):
+    mapper, cfg = get_mapper()
+    conn = get_connection(cfg.db_path)
+    try:
+        chat = find_chat_by_id(conn, mapper, chat_id, tz=cfg.tz)
+        if not chat:
+            return jsonify({"error": "Chat not found"}), 404
+        chat_ids = chat.get("chat_ids") or [chat["chat_id"]]
+        min_dt, max_dt = get_chat_date_range(conn, chat_ids, cfg.tz)
+        if min_dt is None or max_dt is None:
+            return jsonify({"error": "No messages in this chat"}), 404
+        min_local = min_dt.astimezone(cfg.tz) if getattr(min_dt, "tzinfo", None) else min_dt
+        max_local = max_dt.astimezone(cfg.tz) if getattr(max_dt, "tzinfo", None) else max_dt
+        return jsonify({
+            "chat_id": chat_id,
+            "label": chat["label"],
+            "kind": chat.get("kind", "group"),
+            "messages": int(chat.get("messages") or 0),
+            "min_date": min_local.strftime("%Y-%m-%d"),
+            "max_date": max_local.strftime("%Y-%m-%d"),
+        })
+    finally:
+        conn.close()
+
+
 @app.post("/analyze")
 def analyze():
     mapper, base_cfg = get_mapper()
@@ -517,13 +876,10 @@ def analyze():
         flash("Pick a chat from the list.")
         return redirect(url_for("home"))
 
-    year = request.form.get("year") or None
     since = request.form.get("since") or None
     until = request.form.get("until") or None
     keywords = request.form.get("keywords")
     export = request.form.get("export") or "csv,json"
-    if year == "":
-        year = None
     if since == "":
         since = None
     if until == "":
@@ -531,7 +887,6 @@ def analyze():
 
     try:
         cfg = Config.for_app(
-            year=int(year) if year else None,
             since=since,
             until=until,
             keywords=keywords if keywords is not None else None,
