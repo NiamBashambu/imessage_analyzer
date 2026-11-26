@@ -53,6 +53,8 @@ EXPORT_FIELDS = [
     "tapbacks_per_100",
     "given_per_100",
     "balance",
+    "tapbacks_expected",
+    "tapbacks_above_avg",
     "haha_got",
     "haha_given",
     "loved_got",
@@ -896,6 +898,12 @@ def page_key_bullets(page_id, tz_label=None):
             "High score = fewer texts, more reactions per text.",
             tapbacks,
         ],
+        "above": [
+            "Big number = tapbacks received <strong>minus</strong> the expected amount for their volume.",
+            "Expected = chat-wide tapbacks received per message sent, times <strong>their</strong> messages.",
+            "<strong>+</strong> = more tapbacks than an average sender would get. <strong>−</strong> = fewer.",
+            "Ranked high to low. Bar length uses the size of the gap, ignoring the sign.",
+        ],
         "balance": [
             "Big number = tapbacks given ÷ tapbacks received.",
             "Above 1.0 = they react more than they get reacted to.",
@@ -1402,6 +1410,15 @@ def compute_stats(messages, reactions, mapper, keywords=None):
             ),
         })
 
+    # Tapbacks Above Average: received minus what an average sender would get
+    # with the same number of messages (chat-wide tapbacks received per message sent).
+    tapback_total = sum(s["tapbacks_got"] for s in stats.values())
+    avg_tapbacks_per_100 = (tapback_total / total * 100) if total else 0
+    for m in members:
+        expected = avg_tapbacks_per_100 * m["message_count"] / 100
+        m["tapbacks_expected"] = expected
+        m["tapbacks_above_avg"] = m["tapbacks_got"] - expected
+
     max_hour = max(hours.values()) if hours else 1
     hour_bars = []
     for h in range(24):
@@ -1452,6 +1469,7 @@ def compute_stats(messages, reactions, mapper, keywords=None):
         "keyword_boards": keyword_boards,
         "chat_info": {
             "total_messages": total,
+            "tapback_avg_per_100": avg_tapbacks_per_100,
             "member_count": len(members),
             "start_date": start,
             "end_date": end,
@@ -1478,6 +1496,7 @@ EXTRA_GROUPS = [
         ("huh", "Huh", "huh", "❓ received"),
         ("magnet", "Magnet", "magnet", "Tapbacks per message they sent"),
         ("balance", "Balance", "balance", "Given ÷ received"),
+        ("above", "Above avg", "above", "Received vs. an average sender"),
     ]),
     ("Consistency", [
         ("streaks", "Streaks", "streaks", "Longest run of daily texts"),
@@ -1570,7 +1589,7 @@ def ranked(members, key, ascending=False):
     if ascending:
         best = min(values) if values else 1
     else:
-        best = max(values) if values else 1
+        best = max(abs(v) for v in values) if values else 1
     out = []
     for i, m in enumerate(rows, 1):
         item = dict(m)
@@ -1581,7 +1600,7 @@ def ranked(members, key, ascending=False):
         elif ascending:
             item["bar_pct"] = (best / v * 100) if v else 0
         else:
-            item["bar_pct"] = (v / best * 100) if best else 0
+            item["bar_pct"] = (abs(v) / best * 100) if best else 0
         out.append(item)
     return out
 
@@ -1897,6 +1916,22 @@ def render(all_data, config):
                 ("balance", "num", "Given / received"),
                 ("tapbacks_given", "int", "Given"),
                 ("tapbacks_got", "int", "Received"),
+            ],
+        },
+        "above": {
+            "page": "above", "file": "above", "title": "Tapbacks above average", "kicker": "Fair share",
+            # {avg} is filled per chat in render() (chat average tapbacks per 100 messages).
+            "blurb": (
+                "Tapbacks received minus what an average sender would get with the same number of messages "
+                "(chat average {avg:.1f} per 100 msgs). Positive = more than expected."
+            ),
+            "value_key": "tapbacks_above_avg", "value_fmt": "signed",
+            "share_key": "tapbacks_per_100", "share_suffix": "tapbacks / 100 messages they sent",
+            "cols": [
+                ("tapbacks_got", "int", "Tapbacks received"),
+                ("tapbacks_expected", "num", "Expected at avg"),
+                ("tapbacks_per_100", "num", "Per 100 msgs"),
+                ("message_count", "int", "Messages sent"),
             ],
         },
         "pace": {
@@ -2229,12 +2264,15 @@ def render(all_data, config):
                 ascending=spec.get("ascending", False),
             )
             filename = page_filename(spec.get("file"))
+            blurb = spec["blurb"]
+            if spec["page"] == "above":
+                blurb = blurb.format(avg=payload["chat_info"].get("tapback_avg_per_100", 0))
             html = page_t.render(
                 **page_kwargs,
                 page=spec["page"],
                 title=spec["title"],
                 kicker=spec["kicker"],
-                blurb=spec["blurb"],
+                blurb=blurb,
                 members=members,
                 value_key=spec["value_key"],
                 value_fmt=spec["value_fmt"],
@@ -2604,6 +2642,7 @@ a.export-btn:hover { opacity: 0.92; }
   font-size: 1.45rem;
   font-weight: 750;
 }
+.hero.neg { color: #c0392b; }
 .share {
   font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
   font-variant-numeric: tabular-nums;
@@ -3188,11 +3227,12 @@ PAGE_TMPL = """<!DOCTYPE html>
         <div class="who">
           <div class="name">{{ m.name }}</div>
           <div class="hero-wrap">
-            <div class="hero">
-              {% set v = m[value_key] %}
+            {% set v = m[value_key] %}
+            <div class="hero{{ ' neg' if (v is number and v < 0 and value_fmt == 'signed') else '' }}">
               {% if v is none %}—
               {% elif value_fmt == 'int' %}{{ "{:,}".format(v) }}
               {% elif value_fmt == 'reply' %}{{ format_reply(v) }}
+              {% elif value_fmt == 'signed' %}{% set r = v|round|int %}{{ '+' if r > 0 else '−' if r < 0 else '' }}{{ "{:,}".format(r|abs) }}
               {% else %}{{ "%.1f"|format(v) }}{% endif %}
             </div>
             <div class="share">
